@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: static-pv
+  labels:
+    fs-name: mosfs
+spec:
+  accessModes:
+  - ReadWriteMany
+  capacity:
+    storage: 1Gi
+  csi:
+    driver: csi-sandstone-mosfsplugin
+    fsType: ext4
+    nodePublishSecretRef:
+      name: mosfs-secret
+      namespace: default
+    volumeHandle: static-pv
+    volumeAttributes:
+      subPath: your-subDir
+  persistentVolumeReclaimPolicy: Retain
+  volumeMode: Filesystem

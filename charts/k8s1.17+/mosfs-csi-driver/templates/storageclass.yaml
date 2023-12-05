@@ -1,0 +1,101 @@
+{{ $namespace := .Values.namespace }}
+{{ $cephConf := .Values.cephConf }}
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ceph-conf
+  namespace: {{ $namespace }}
+type: Opaque
+data:
+  ceph.conf: {{ $cephConf }}
+  ceph.client.admin.keyring: ""
+---
+{{- range $_, $sc := .Values.storageClasses }}
+
+{{- if $sc.enabled }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $sc.name }}-secret
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "mosfs-csi.labels" $ | nindent 4 }}
+type: Opaque
+data:
+  {{- with $sc.backend }}
+  name: {{ .fileSystemName | b64enc | quote }}
+  token: {{ .token | b64enc | quote }}
+  consoleToken: {{ .consoleToken | b64enc | quote }}
+  {{- if .accessKey }}
+  accesskey: {{ .accessKey | b64enc | quote }}
+  {{- end }}
+  {{- if .secretKey }}
+  secretkey: {{ .secretKey | b64enc | quote }}
+  {{- end }}
+  {{- if .storage }}
+  storage: {{ .storage | b64enc | quote }}
+  {{- end }}
+  {{- if .configs }}
+  configs: {{ .configs | b64enc | quote }}
+  {{- end }}
+  envs: {{ .envs | b64enc | quote }}
+  {{- end }}
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: {{ $sc.name }}-snapshotclass
+  labels:
+    {{- include "mosfs-csi.labels" $ | nindent 4 }}
+driver: csi-sandstone-mosfsplugin
+deletionPolicy: {{ $sc.deletionPolicy }}
+parameters:
+  csi.storage.k8s.io/snapshotter-secret-name: {{ $sc.name }}-secret
+  csi.storage.k8s.io/snapshotter-secret-namespace: {{ $namespace }}
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  labels:
+    {{- include "mosfs-csi.labels" $ | nindent 4 }}
+  name: {{ $sc.name }}
+{{- if $sc.mountOptions }}
+mountOptions:
+  {{- toYaml $sc.mountOptions | nindent 2 }}
+{{- end }}
+parameters:
+  csi.storage.k8s.io/node-publish-secret-name: {{ $sc.name }}-secret
+  csi.storage.k8s.io/node-publish-secret-namespace: {{ $namespace }}
+  csi.storage.k8s.io/provisioner-secret-name: {{ $sc.name }}-secret
+  csi.storage.k8s.io/provisioner-secret-namespace: {{ $namespace }}
+  csi.storage.k8s.io/controller-expand-secret-name: {{ $sc.name }}-secret
+  csi.storage.k8s.io/controller-expand-secret-namespace: {{ $namespace }}
+  {{- with $sc.mountPod }}
+  {{- if .resources.limits }}
+  {{- if .resources.limits.cpu }}
+  mountpod/cpu-limit: {{ .resources.limits.cpu }}
+  {{- end }}
+  {{- if .resources.limits.memory }}
+  mountpod/memory-limit: {{ .resources.limits.memory }}
+  {{- end }}
+  {{- end }}
+  {{- if .resources.requests }}
+  {{- if .resources.requests.cpu }}
+  mountpod/cpu-request: {{ .resources.requests.cpu }}
+  {{- end }}
+  {{- if .resources.requests.memory }}
+  mountpod/memory-request: {{ .resources.requests.memory }}
+  {{- end }}
+  {{- if .deleteDelay }}
+  mountpod/mount-delete-delay: {{ .deleteDelay }}
+  {{- end }}
+  {{- end }}
+  {{- end }}
+provisioner: csi-sandstone-mosfsplugin
+allowVolumeExpansion: true
+reclaimPolicy: {{ $sc.reclaimPolicy }}
+volumeBindingMode: Immediate
+{{- end }}
+---
+{{- end }}

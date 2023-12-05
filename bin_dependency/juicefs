@@ -1,0 +1,2502 @@
+#!/bin/sh
+
+''':'
+if [ "$1" = "init" ]; then
+    printf "{\"status\":\"Success\",\"capabilities\":{\"attach\":false}}" >&1
+    exit 0
+fi
+PATH=$PATH:/usr/local/bin
+PYTHON=`command -v python3`
+if [ -z $PYTHON ]; then
+    PYTHON=`command -v python`
+fi
+if [ -z $PYTHON ]; then
+    PYTHON=`command -v python2`
+fi
+if [ -z $PYTHON ]; then
+    echo "no Python available, please install it first"
+    exit 1
+fi
+exec $PYTHON $0 "$@"
+exit $?
+''' #'''
+import sys
+import os
+import stat
+import datetime
+import time
+import platform
+import optparse
+import json
+import math
+import socket
+import array
+import struct
+import signal
+import locale
+import syslog
+import subprocess
+import types
+from collections import namedtuple, deque, defaultdict
+
+
+
+Py2 = sys.version_info[0] == 2
+Py3 = sys.version_info[0] == 3
+
+if Py3:
+    string_types = str,
+    integer_types = int,
+    class_types = type,
+    text_type = str
+    binary_type = bytes
+    import http.client as httplib
+    from urllib.parse import urlparse, urlencode, quote, urlunparse
+    from urllib.request import urlopen, Request
+    from urllib.error import HTTPError
+    raw_input = input
+else:
+    string_types = basestring,
+    integer_types = (int, long)
+    class_types = (type, types.ClassType)
+    text_type = unicode
+    binary_type = str
+    import httplib
+    from urlparse import urlparse, urlunparse
+    from urllib import urlencode, quote
+    from urllib2 import urlopen, Request
+    from urllib2 import HTTPError
+
+
+def ensure_binary(s, encoding='utf-8', errors='strict'):
+    if isinstance(s, text_type):
+        return s.encode(encoding, errors)
+    elif isinstance(s, binary_type):
+        return s
+    raise TypeError("not expecting type '%s'" % type(s))
+
+
+def ensure_str(s, encoding='utf-8', errors='strict'):
+    if not isinstance(s, (text_type, binary_type)):
+        raise TypeError("not expecting type '%s'" % type(s))
+    if Py2 and isinstance(s, text_type):
+        s = s.encode(encoding, errors)
+    elif Py3 and isinstance(s, binary_type):
+        s = s.decode(encoding, errors)
+    return s
+
+
+def ensure_text(s, encoding='utf-8', errors='strict'):
+    if isinstance(s, binary_type):
+        return s.decode(encoding, errors)
+    elif isinstance(s, text_type):
+        return s
+    raise TypeError("not expecting type '%s'" % type(s))
+
+
+OS = platform.system()
+syslog.openlog("juicefs", syslog.LOG_PID | syslog.LOG_USER)
+ORIG_ARGV = sys.argv[:]
+COMMAND = os.path.abspath(sys.argv[0])
+SELFPATH = os.path.realpath(COMMAND)
+insideDocker = os.path.exists('/.dockerenv')
+STATUS_ERROR = {
+        1: "Operation not permitted",
+        3: "No such file or directory",
+        4: "Permission denied",
+        6: "Invalid argument",
+        34: "Quota exceeded"
+}
+
+class Session(namedtuple('Session', ('sessionid', 'ip1', 'ip2', 'ip3', 'ip4', 'info'))):
+
+    @property
+    def ip(self):
+        return "%u.%u.%u.%u" % (self.ip1, self.ip2, self.ip3, self.ip4)
+
+    @property
+    def host(self):
+        if ':' in self.info:
+            return self.info.split(':', 1)[0]
+        return self.info
+
+    @property
+    def mountpoint(self):
+        if ':' in self.info:
+            return self.info.split(':', 1)[-1].rstrip('/')
+        return ''
+
+def log(level, msg):
+    now = datetime.datetime.now()
+    sys.stderr.write('{0} {1}\n'.format(now, msg))
+    if not insideDocker:
+        syslog.syslog(level, msg)
+
+BASE = os.environ.get("BASE_URL", "http://s.juicefs.com/static")
+JFS_URL = BASE + "/juicefs"
+MOUNT_URL = os.environ.get("MOUNT_URL")
+if not MOUNT_URL:
+    MOUNT_URL = BASE + "/%s/mount" % OS
+    if os.uname()[4] != "x86_64":
+        MOUNT_URL += "." + os.uname()[4]
+CFG_URL = os.environ.get("CFG_URL", "https://juicefs.com/volume/%s/mount")
+
+ROOT = os.path.join(os.environ["HOME"] if os.getuid() or not os.path.exists("/root")
+                                       else "/root", ".juicefs")
+MOUNT_PATH = os.environ.get("JFS_MOUNT_PATH", os.path.join(ROOT, "jfsmount"))
+
+if 'JFSCHAN' in os.environ:
+    MOUNT_URL += "." + os.environ['JFSCHAN']
+    MOUNT_PATH += "." + os.environ['JFSCHAN']
+
+def retry(tries=6, delay=1, backoff=2):
+    def deco_retry(f):
+        from functools import wraps
+        @wraps(f)
+        def f_retry(*args, **kwargs):
+            mtries, mdelay = tries, delay
+            while mtries > 0:
+                try:
+                    return f(*args, **kwargs)
+                except Exception as e:
+                    msg = 'func %s raises %s, retrying in %d seconds...' % (f.__name__, e, mdelay)
+                    log(syslog.LOG_WARNING, msg)
+                    time.sleep(mdelay)
+                    mtries -= 1
+                    mdelay *= backoff
+            log(syslog.LOG_CRIT, "func %s failed %d times, abort" % (f.__name__, tries))
+            sys.exit(1)
+        return f_retry
+    return deco_retry
+
+def parse_last_modified(header):
+    from email.utils import parsedate_tz, mktime_tz
+    mod = parsedate_tz(header)
+    if mod:
+        return mktime_tz(mod)
+
+def head_url(url, timeout=10):
+    o = urlparse(url)
+    klass = {'http': httplib.HTTPConnection,
+             'https': httplib.HTTPSConnection}[o.scheme]
+    conn = klass(o.hostname, o.port, timeout=timeout)
+    path = urlunparse(o._replace(scheme='', netloc=''))
+    conn.request('HEAD', path)
+    return conn.getresponse()
+
+def need_update(path, url):
+    if not os.path.exists(path):
+        return True
+
+    mtime = os.path.getmtime(path)
+    try:
+        response = head_url(url)
+    except:
+        log(syslog.LOG_WARNING,"Failed to head_url(%s): %s" % (url, sys.exc_info()[1]))
+        return False
+    if response.status != 200:
+        return False
+    last_mod = parse_last_modified(response.getheader("last-modified"))
+    return last_mod and last_mod > mtime
+
+@retry(tries=3)
+def download(path, url, timeout=10,
+             mode=stat.S_IXUSR | stat.S_IRUSR | stat.S_IROTH | stat.S_IXOTH,
+             check_integrity=None):
+    request = Request(url)
+    request.add_header('Accept-encoding', 'gzip')
+    request.add_header('User-Agent', 'JuiceFS')
+
+    response = urlopen(request, timeout=timeout)
+    assert response.getcode() == 200
+    data = response.read()
+    last_mod = parse_last_modified(response.info().get('last-modified'))
+
+    tmp = path+".tmp"
+    d = os.path.dirname(tmp)
+    if not os.path.exists(d):
+        os.makedirs(d, mode | stat.S_IWUSR)
+    with open(tmp, 'wb') as f:
+        f.write(data)
+    os.chmod(tmp, mode)
+
+    if check_integrity and not check_integrity(tmp):
+        os.remove(tmp)
+        # raise exception to retry
+        raise Exception('downloaded file({0}) is broken'.format(tmp))
+
+    if last_mod:
+        atime = os.path.getatime(tmp)
+        os.utime(tmp, (atime, last_mod))
+
+    os.rename(tmp, path)
+    mtime = os.path.getmtime(path)
+    return not last_mod or last_mod <= mtime
+
+def update(path, url, check_integrity=None):
+    if need_update(path, url):
+        download(path, url, check_integrity=check_integrity)
+        return True
+
+
+def check_mount_integrity(path):
+    try:
+        from subprocess import DEVNULL
+    except ImportError:
+        DEVNULL = open(os.devnull, 'wb')
+    try:
+        subprocess.check_call([path, '-V'], stdout=DEVNULL, stderr=DEVNULL)
+    except subprocess.CalledProcessError:
+        return False
+    return True
+
+
+def install():
+    try:
+        if not os.path.exists(MOUNT_PATH):
+            download(MOUNT_PATH, MOUNT_URL, check_integrity=check_mount_integrity)
+    except Exception:
+        log(syslog.LOG_ERR,"Failed to download jfsmount: %s" % sys.exc_info()[1])
+        sys.exit(1)
+
+    if OS == "Linux":
+        if os.getuid() == 0:
+            mountpath = "/sbin/mount.juicefs"
+            if not os.path.exists(mountpath):
+                os.system("ln -sf %s %s" % (SELFPATH, mountpath))
+        if not insideDocker:
+            subprocess.call("/sbin/modprobe fuse", shell=True, stdout=subprocess.PIPE)
+
+def gen_s3_endpoint(region, bucket, external):
+    # this endpoint is fake
+    return "%s.s3-%s.amazonaws.com" % (bucket, region)
+
+def gen_oss_endpoint(region, bucket, external):
+    if external:
+        return "%s.oss-%s.aliyuncs.com" % (bucket, region)
+    host = "%s.oss-%s-internal.aliyuncs.com" % (bucket, region)
+    if test_endpoint(host):
+        return host
+    return "%s.vpc100-oss-%s.aliyuncs.com" % (bucket, region)
+
+def gen_ufile_endpoint(region, bucket, external):
+    # https://docs.ucloud.cn/storage_cdn/ufile/faq.html
+    if external:
+        return '%s.%s.ufileos.com' % (bucket, region)
+    if region == 'cn-bj':
+        # TODO: choose the best endpoint for a zone
+        return '%s.ufile.cn-north-02.ucloud.cn' % bucket
+    elif region == 'cn-gd':
+        return bucket + '.internal-cn-gd-02.ufileos.com'
+    else:
+        return '%s.internal-%s-01.ufileos.com' % (bucket, region)
+
+def gen_qingstor_endpoint(region, bucket, external):
+    return "%s.%s.qingstor.com" % (bucket, region)
+
+def gen_gs_endpoint(region, bucket, external):
+    return "%s.%s.googleapis.com" % (bucket, region)
+
+def gen_ks3_endpoint(region, bucket, external):
+    if region == "cn-hangzhou":
+        if external:
+            return "%s.kss.ksyun.com" % bucket
+        else:
+            return "%s.kss-internal.ksyun.com" % bucket
+    if external:
+        return "%s.ks3-%s.ksyun.com" % (bucket, region)
+    return "%s.ks3-%s-internal.ksyun.com" % (bucket, region)
+
+def gen_qiniu_endpoint(region, bucket, external):
+    if not external and region == "cn-east-1":
+        return "%s.qvm-s3v2.qiniucs.com" % bucket
+    elif not external and region == "cn-north-1":
+        return "%s.qvm-z1-s3v2.qiniucs.com" % bucket
+    return "%s.s3-%s.qiniucs.com" % (bucket, region)
+
+def gen_cos_endpoint(region, bucket, external):
+    return "%s.cos.%s.myqcloud.com" % (bucket, region)
+
+def gen_wasb_endpoint(region, container, external):
+    if 'china' in region:
+        return "%s.core.chinacloudapi.cn" % container
+    return "%s.core.windows.net" % container
+
+def gen_nos_endpoint(region, bucket, external):
+    if external:
+        return '%s.nos-%s.126.net' % (bucket, region)
+    return '%s.nos-%s-i.netease.com' % (bucket, region)
+
+def gen_mss_endpoint(region, bucket, external):
+    if region == 'northchina1':
+        return '%s.mtmss.com' % bucket
+    return "%s.%s.mtmss.com" % (bucket, region)
+
+def gen_jss_endpoint(region, bucket, external):
+    return "%s.s3.%s.jcloudcs.com" % (bucket, region)
+
+def gen_speedy_endpoint(region, bucket, external):
+    return "%s.oss-%s.speedycloud.org" % (bucket, region)
+
+def gen_b2_endpoint(region, bucket, external):
+    return "%s.backblaze.com" % bucket
+
+def gen_ceph_endpoint(region, bucket, external):
+    return bucket
+
+def gen_space_endpoint(region, bucket, external):
+    return '%s.%s.digitaloceanspaces.com' % (bucket, region)
+
+def gen_bos_endpoint(region, bucket, external):
+    return '%s.%s.bcebos.com' % (bucket, region)
+
+def gen_file_endpoint(region, bucket, external):
+    if bucket.startswith('/'):
+        return bucket
+    return os.path.join(region, bucket)
+
+def gen_minio_endpoint(region, bucket, external):
+    return "http://%s/%s" % (region, bucket)
+
+def gen_obs_endpoint(region, bucket, external):
+    return "%s.obs.%s.myhuaweicloud.com" % (bucket, region)
+
+def gen_wasabi_endpoint(region, bucket, external):
+    return "https://%s.s3.%s.wasabisys.com" % (bucket, region)
+
+def gen_upyun_endpoint(region, bucket, external):
+    return bucket
+
+def gen_yovole_endpoint(region, bucket, external):
+    if external:
+        return "%s.%s.cloud-oss.com" % (bucket, region)
+    return "%s.%s-internal.cloud-oss.com" % (bucket, region)
+
+def gen_ibmcos_endpoint(region, bucket, external):
+    if external:
+        return "%s.s3.%s.cloud-object-storage.appdomain.cloud" % (bucket, region)
+    return "%s.s3.direct.%s.cloud-object-storage.appdomain.cloud" % (bucket, region)
+
+def gen_scw_endpoint(region, bucket, external):
+    return "%s.s3.%s.scw.cloud" % (bucket, region)
+
+def gen_linode_endpoint(region, bucket, external):
+    return "%s.%s.linodeobjects.com" % (bucket, region)
+
+NEED_TESTS = ("oss", "ufile", "ks3", "nos", "jss", "qiniu", "yovole", "ibmcos")
+
+def support_https(storage, endpoint):
+    if storage == 'ufile':
+        return not ('.internal-' in endpoint or endpoint.endswith('.ucloud.cn'))
+    elif storage == 'oss':
+        return not ('.vpc100-oss' in endpoint or 'internal.aliyuncs.com' in endpoint)
+    elif storage == 'jss':
+        return test_endpoint(endpoint, 443, 1)
+    elif storage == 'qiniu':
+        return 'qvm' not in endpoint
+    else:
+        return True
+
+def test_endpoint(host, port=80, timeout=2):
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.settimeout(timeout)
+        s.connect((host, port))
+        return True
+    except socket.error:
+        return False
+    finally:
+        s.close()
+
+def _umount(mp, force=True):
+    if OS == "Linux":
+        cmd = ["umount", mp]
+        if force:
+            cmd.insert(1, "-l")
+    else:
+        cmd = ["diskutil", "umount", mp]
+        if force:
+            cmd.insert(2, "force")
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError as err:
+        return err.returncode
+    return 0
+
+# their endpoints are not restful, no accesskey required
+special_engines = ('gs', 'file', 'tikv', 'beansdb', 'hdfs')
+
+def create_endpoint(name, cfg, options, suffix=''):
+    storage = cfg['storage' + suffix]
+    bucket = cfg['bucket' + suffix]
+    external = getattr(options, "external", False)
+    internal = getattr(options, "internal", False)
+    if ("." not in bucket and ':' not in bucket) or external or internal:
+        if "." in bucket:
+            bucket = bucket.split('.')[0]
+        region = cfg['region' + suffix]
+        endpoint = globals()["gen_%s_endpoint" % storage](region, bucket, external)
+        if storage in NEED_TESTS and not external and not internal and not test_endpoint(endpoint):
+            endpoint = globals()["gen_%s_endpoint" % storage](region, bucket, True)
+            # log(syslog.LOG_NOTICE, "use external endpoint: %s" % endpoint)
+        cfg['bucket' + suffix] = endpoint
+    else:
+        endpoint = bucket
+    if not endpoint.startswith("http") and (storage == 'gs' or storage not in special_engines):
+        if support_https(storage, endpoint):
+            endpoint = "https://" + endpoint
+        else:
+            endpoint = "http://" + endpoint
+    return endpoint
+
+mount_pid = None
+last_active = None
+thread_id = 0
+
+def get_thread_id():
+    try:
+        import ctypes
+        libc = ctypes.cdll.LoadLibrary('libc.so.6')
+        return libc.syscall(186)
+    except :
+        return 0
+
+def check_mount_point(mp):
+    global last_active, thread_id
+    thread_id = get_thread_id()
+    last_active = time.time()
+    while True:
+        try: os.statvfs(mp) # up to 10 seconds
+        except: pass
+        last_active = time.time()
+        time.sleep(5)
+
+def show_thread_stack(thread_id):
+    if OS == 'Linux' and thread_id > 0:
+        os.system("cat /proc/%d/task/%d/stack" % (os.getpid(), thread_id))
+    os.system("curl localhost:6060/debug/pprof/goroutine?debug=1")
+
+def kill_mount_process(mount_pid, st_dev):
+    if OS == 'Linux':
+        os.system("cat /proc/%d/task/*/stack" % mount_pid)
+    # if OS == 'Linux' and st_dev:
+    #     try:
+    #         with open('/sys/fs/fuse/connections/{0}/abort'.format(st_dev), 'wb') as f:
+    #             f.write(b'1')
+    #     except Exception:
+    #         pass
+    #     st_dev = 0
+    # try: os.kill(mount_pid, signal.SIGKILL)
+    # except: pass
+
+def watchdog(mp):
+    global last_active
+    last_active = time.time()
+    st_dev = 0
+    while True:
+        if not st_dev:
+            try:
+                st = os.stat(mp)
+                if st.st_ino == 1:
+                    st_dev = st.st_dev
+            except: pass
+        if mount_pid is not None and last_active+30 < time.time():
+            log(syslog.LOG_NOTICE, "watchdog: not active for %f seconds" % (time.time()-last_active))
+            show_thread_stack(thread_id)
+            time.sleep(30)
+            # double check
+            if last_active+60 > time.time():
+                continue
+            log(syslog.LOG_NOTICE, "watchdog: kill %d" % mount_pid)
+            show_thread_stack(thread_id)
+            kill_mount_process(mount_pid, st_dev)
+            last_active = time.time()
+        time.sleep(10)
+
+def start_thread(target, args=(), daemon=True):
+    import threading
+    t = threading.Thread(target=target, args=args)
+    t.daemon = daemon
+    t.start()
+
+def prepare_environ(name, cfg, options):
+    rootname = cfg.get('rootname', name)
+    if 'master' in cfg:
+        host, port = cfg['master'].split(':')
+        port = int(port) - 100
+        os.environ["master"] = "%s:%s:/%s" % (host, port, rootname)
+        os.environ['mfspassword'] = cfg['password']
+        os.environ["master_ip"] = ','.join(cfg.get("master_ip", []))
+    else:
+        os.environ["master"] = 'local:0:/' + rootname
+        options.writeback = True
+    os.environ['GOGC'] = '50'
+    if cfg['storage'] == 'wasb' or cfg.get('storage2') == 'wasb':
+        # disable HTTP/2 for better concurrency
+        os.environ['GODEBUG'] = "http2client=0"
+    os.environ["BLOCK_PARTITIONS"] = str(cfg.get("partitions", 0))
+    os.environ["storage"] = cfg["storage"]
+    os.environ["endpoint"] = create_endpoint(name, cfg, options)
+    os.environ["ACCESS_KEY"] = cfg.get('accesskey') or ''
+    os.environ["SECRET_KEY"] = cfg.get('secretkey') or ''
+    if cfg.get('replicated', False):
+        os.environ["storage2"] = cfg['storage2']
+        os.environ["endpoint2"] = create_endpoint(name, cfg, options, "2")
+        os.environ["ACCESS_KEY2"] = cfg.get('accesskey2') or ''
+        os.environ["SECRET_KEY2"] = cfg.get('secretkey2') or ''
+    if cfg.get('encrypt') or getattr(options, "rsaKey", None):
+        if cfg.get('rsakey'):
+            os.environ["RSA_KEY"] = cfg['rsakey']
+        if cfg.get('passphrase') is not None:
+            os.environ['JFS_RSA_PASSPHRASE'] = cfg['passphrase']
+        if 'JFS_RSA_PASSPHRASE' not in os.environ:
+            import getpass
+            os.environ['JFS_RSA_PASSPHRASE'] = getpass.getpass("RSA passphrase:")
+
+def test_credentials(name, cfg, options):
+    if 'tested' in cfg and (not cfg.get('replicated') or 'tested2' in cfg) and not cfg.get('encrypt'):
+        save_cfg(name, cfg)
+        return
+    prepare_environ(name, cfg, options)
+    args = ["juicefs", "-ssl", "-test"]
+    if getattr(options, "debug", False):
+        args.append("-v")
+    if options.subdir:
+        args.append("-subdir")
+        args.append(options.subdir)
+    pid = os.fork()
+    if pid == 0:
+        os.execv(MOUNT_PATH, args)
+        sys.exit(0)
+    _, status = os.waitpid(pid, 0)
+    if status != 0:
+        sys.exit(-1)
+    cfg['tested'] = 1
+    if cfg.get('replicated'):
+        cfg['tested2'] = 1
+    save_cfg(name, cfg)
+
+def gen_opts(name, options):
+    opts = "fsname=JuiceFS:%s" % name
+    if options.fuse_opts:
+        opts += ',' + options.fuse_opts
+    if options.allow_other or os.getuid()==0:
+        opts += ",allow_other"
+    if OS == 'Darwin':
+        opts += ",allow_recursion"
+    elif OS == "Linux":
+        opts += ",nonempty"
+    return opts
+
+def send_fds(sock, msg, fds):
+    return sock.sendmsg([msg], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", fds))])
+
+def recv_fds(sock, msglen, maxfds):
+    fds = array.array("i")   # Array of ints
+    msg, ancdata, flags, addr = sock.recvmsg(msglen, socket.CMSG_LEN(maxfds * fds.itemsize))
+    for cmsg_level, cmsg_type, cmsg_data in ancdata:
+        if cmsg_level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS:
+            # Append data, ignoring any truncated integers at the end.
+            fds.frombytes(cmsg_data[:len(cmsg_data) - (len(cmsg_data) % fds.itemsize)])
+    return msg, list(fds)
+
+fuse_fd = 0
+fuse_setting = b'FUSE'
+
+def serve_fuse_fd(sock):
+    global fuse_fd, fuse_setting
+    try:
+        fds = [0]
+        if fuse_fd > 0 :
+            fds.append(fuse_fd)
+        send_fds(sock, fuse_setting, fds)
+        msg, fds = recv_fds(sock, 5, 1)
+        if msg == b"CLOSE":
+            os.close(fds[0])
+            fuse_fd = -1
+        elif fuse_fd == 0 and len(fds) == 1:
+            fuse_fd = fds[0]
+            fuse_setting = msg
+    except Exception as e:
+        log(syslog.LOG_CRIT, str(e))
+    finally:
+        sock.close()
+
+def get_fuse_fd(path):
+    if not os.path.exists(path):
+        return
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(path)
+        msg, fds = recv_fds(sock, 5, 2)
+        os.close(fds[0])
+        if len(fds) > 1:
+            send_fds(sock, b"CLOSE", [0]) # close it
+            return fds[1], msg
+    except Exception as e:
+        log(syslog.LOG_CRIT, str(e))
+    finally:
+        sock.close()
+
+def fuse_fd_server(path):
+    try:
+        os.unlink(path)
+    except Exception:
+        if os.path.exists(path):
+            raise
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(path)
+    sock.listen(1)
+    while True:
+        conn, addr = sock.accept()
+        start_thread(target=serve_fuse_fd, args=(conn,))
+
+def shutdown_graceful(mountpoint):
+    try:
+        path = os.path.join(mountpoint, ".jfsconfig")
+        if not os.path.exists(path): return
+        cfg = json.load(open(path))
+        pid = cfg.get("Pid")
+        fdcomm = cfg.get("CommPath")
+        if not fdcomm:
+            return
+        r = get_fuse_fd(fdcomm)
+        if r:
+            global fuse_fd, fuse_setting
+            fuse_fd, fuse_setting = r
+            os.environ["_FUSE_STATE_PATH"] = cfg.get("StatePath")
+            for i in range(100):
+                try:
+                    os.kill(pid, signal.SIGHUP)
+                except OSError as e:
+                    break
+                time.sleep(0.1)
+            else:
+                log(syslog.LOG_INFO, "mount point %s is busy, stop upgrade" % (mountpoint))
+                sys.exit(1)
+    except Exception as e:
+        log(syslog.LOG_CRIT, str(e))
+
+server_address = "/tmp/fuse_fd_comm.%d" % os.getpid()
+
+def launch_mount(name, mountpoint, cfg, options):
+    prepare_environ(name, cfg, options)
+    os.environ['MAX_UPLOAD'] = str(options.maxUploads)
+    cacheDirs = [os.path.join(d, name) for d in options.cacheDir.split(":")]
+    args = ["juicefs", "-mountpoint", mountpoint, "-ssl",
+            "-cacheDir", ":".join(cacheDirs),
+            "-cacheSize", str(options.cacheSize),
+            "-o", gen_opts(name, options)]
+    if options.debug:
+        args.append("-v")
+        if options.foreground:
+            args.append("-nosyslog")
+    if options.enable_xattr:
+        args.append("-xattrs")
+    if options.enable_acl:
+        args.append("-acl")
+    if options.no_posix_lock:
+        args.append("-noposixlock")
+    if options.no_bsd_lock:
+        args.append("-nobsdlock")
+    if options.blockInterrupt != 1:
+        args.extend(["-nobsdlock", str(options.blockInterrupt)])
+    if options.writeback:
+        args.append("-async")
+    if options.uploadLimit:
+        args.extend(("-uploadLimit", str(int(options.uploadLimit/8.0*1024*1024))))
+    if options.downloadLimit:
+        args.extend(("-downloadLimit", str(int(options.downloadLimit/8.0*1024*1024))))
+    if options.deleteLimit is not None:
+        args.extend(("-deleteLimit", str(options.deleteLimit)))
+    if options.getTimeout is not None:
+        args.extend(("-getTimeout", str(options.getTimeout)))
+    if options.putTimeout is not None:
+        args.extend(("-putTimeout", str(options.putTimeout)))
+    if options.prefetch != 1:
+        args.extend(("-prefetch", str(options.prefetch)))
+    if options.batch:
+        if options.writeback:
+            args.extend(['-batch', str(int(options.batch*1000))])
+        else:
+            log(syslog.LOG_WARNING, "--batch can only be used together with --writeback, ignore it")
+    if options.gc:
+        args.append("-gc")
+    if options.dry:
+        args.append("-dry")
+    if options.nosync:
+        args.append("-nosync")
+    if options.metacacheto:
+        args.extend(["-metacacheto", str(options.metacacheto)])
+    if options.maxCachedInodes != 5000000:
+        args.extend(["-maxCachedInodes", str(options.maxCachedInodes)])
+    if options.opencache:
+        args.append("-opencache")
+    if options.attrcacheto:
+        args.extend(["-attrcacheto", str(options.attrcacheto)])
+    if options.entrycacheto:
+        args.extend(["-entrycacheto", str(options.entrycacheto)])
+    if options.direntrycacheto:
+        args.extend(["-direntrycacheto", str(options.direntrycacheto)])
+    if options.cacheGroup:
+        args.append("-cacheGroup")
+        if options.subGroups > 1:
+            import random
+            options.cacheGroup += "-" + str(random.randint(1, options.subGroups))
+        args.append(options.cacheGroup)
+    if options.groupIP:
+        args.append("-groupIP")
+        args.append(options.groupIP)
+    if options.noSharing:
+        args.append("-noSharing")
+    if options.flip:
+        args.append("-flip")
+    if options.subdir:
+        args.append("-subdir")
+        args.append(options.subdir)
+    if options.address:
+        args.append("-http")
+        args.append(options.address)
+        if options.disallowList:
+            args.append("-disallowList")
+    if options.rsaKey:
+        args.append("-rsaPrivKeyPath")
+        args.append(os.path.abspath(options.rsaKey))
+    if cfg.get('blockSize', 4096) != 4096:
+        args.append("-objectSize")
+        args.append(str(cfg['blockSize']))
+    if options.cacheMode:
+        args.append("-cacheMode")
+        args.append(options.cacheMode)
+    if not cfg.get("compress", "zstd0").startswith('zstd0'):
+        args.append("-compress")
+        args.append(cfg["compress"])
+    if cfg.get('compatible', False):
+        args.append("-direct")
+    if options.minBalanceDiff:
+        args.append("-maxInodesDifference")
+        args.append(str(options.minBalanceDiff))
+    if options.minDirInodes:
+        args.append("-minInodesToBalance")
+        args.append(str(options.minDirInodes))
+    if options.maxSpace:
+        args.append("-maxSpace")
+        args.append(str(options.maxSpace<<30))
+    if options.sourceDir:
+        args.append("-source")
+        args.append(options.sourceDir)
+    if options.refreshInterval != 60:
+        args.append("-refresh")
+        args.append(str(options.refreshInterval))
+    if options.bufferSize:
+        args.append("-bufferSize")
+        args.append(str(options.bufferSize))
+    if options.cachePartialOnly:
+        args.append("-cachePartialOnly")
+    if options.ioretries != 30:
+        args.append("-ioretries")
+        args.append(str(options.ioretries))
+    if options.freeSpace != 0.2:
+        args.append("-freeSpace")
+        args.append(str(options.freeSpace))
+
+    if not options.foreground and (os.getppid() != 1 or insideDocker) or options.background:
+        daemonize(name, mountpoint, options)
+
+    # increase rlimit
+    i = 100000
+    import resource
+    while i > 1000:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (i, i))
+            break
+        except Exception as e:
+            i = i * 2 / 3
+    # change oom_score_adj to avoid OOM-killer
+    if OS == 'Linux' and not insideDocker and os.getuid() == 0 and os.path.exists('/proc/self/oom_score_adj'):
+        f = open('/proc/self/oom_score_adj', 'w')
+        f.write(str(-1000))  # disable it
+        f.close()
+
+    global mount_pid
+    start_thread(check_mount_point, (mountpoint,))
+    start_thread(watchdog, (mountpoint,))
+    if sys.version_info > (3, 3): # socket.sendmsg is available in 3.3+
+        if os.stat(mountpoint).st_ino == 1:
+            shutdown_graceful(mountpoint)
+        os.environ['_FUSE_FD_COMM'] = server_address
+        start_thread(fuse_fd_server, (server_address,))
+    else:
+        log(syslog.LOG_INFO, "please install python 3.3+ to enable graceful upgrade")
+    start = time.time()
+    c = 0
+    while True:
+        try:
+            c += 1
+            if fuse_fd < 0:
+                sys.exit(0)
+            if fuse_fd == 0:
+                _umount(mountpoint)
+            mount_pid = os.fork()
+            if mount_pid == 0:
+                os.execv(MOUNT_PATH, args)
+                return
+            _, code = os.waitpid(mount_pid, 0)
+            if code == 0:
+                return
+            if c == 2 and time.time() - start < 10:
+                return
+        except Exception:
+            log(syslog.LOG_CRIT, "mount exited: %s" % sys.exc_info()[1])
+            if mount_pid is not None:
+                os.kill(mount_pid, signal.SIGKILL)
+        except BaseException:
+            break
+        finally:
+            mount_pid = None
+
+def require_input(msg):
+    if not sys.stdin.isatty():
+        return ''
+    return raw_input(msg + ": ")
+
+def save_cfg(name, cfg):
+    path = os.path.join(ROOT, name + ".conf")
+    jdir = os.path.dirname(path)
+    if not os.path.exists(jdir):
+        os.makedirs(jdir)
+    f = open(path, 'wb')
+    f.write(json.dumps(cfg, indent=2).encode('utf-8'))
+    f.close()
+    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # only owner can read it
+
+def load_cfg(name, update=True, **kw):
+    path = os.path.join(ROOT, name + ".conf")
+    cfg = {}
+    timeout = 10
+    try:
+        if os.path.exists(path):
+            cfg = json.load(open(path))
+            timeout = 3
+        elif not update:
+            log(syslog.LOG_ERR, "Configuration file: %s not exist." % path)
+            sys.exit(1)
+    except Exception:
+        log(syslog.LOG_CRIT, "Failed to load cached config: %s" % sys.exc_info()[1])
+        os.remove(path)
+    cfg.update(kw)
+    if update:
+        return update_cfg(name, timeout, **cfg)
+    return cfg
+
+KEYNAMES = {
+    "s3": ("Access key ID", "Secret access key"),
+    "ufile": ("Public key", "Private key"),
+    "oss": ("Access key ID", "Access key secret"),
+    "cos": ("Secret ID", "Secret key"),
+    "qiniu": ("Access key", "Secret key"),
+    "bos": ("Access key", "Secret key"),
+    "ks3": ("Secret ID", "Secret key"),
+    "wasb": ("Storage account", "access key"),
+    "ceph": ("cluster", "user"),
+    "b2": ("Key ID", "Application Key"),
+    "space": ("Spaces access key", "Spaces secret key"),
+    "upyun": ("Operator", "Password"),
+    "ibmcos": ("API Key", "Resource Instance ID"),
+}
+
+def access_key_name(storage):
+    return (KEYNAMES.get(storage) or KEYNAMES["s3"])[0]
+
+def secret_key_name(storage):
+    return (KEYNAMES.get(storage) or KEYNAMES["s3"])[1]
+
+def update_cfg(name, timeout=10, token=None, **kw):
+    global CFG_URL
+    if not token and 'passwd' in kw:
+        token = kw['passwd']
+    if not token:
+        token = require_input("Token for %s" % name)
+    try:
+        param = urlencode({'token': token})
+        try:
+            data = urlopen(CFG_URL % name, param.encode('utf-8'), timeout=timeout).read()
+        except IOError as e:
+            if 'CERTIFICATE_VERIFY_FAILED' not in str(e):
+                raise
+            # fallback to HTTP for expired root certificate
+            CFG_URL = CFG_URL.replace('https://', 'http://')
+            data = urlopen(CFG_URL % name, param.encode('utf-8'), timeout=timeout).read()
+        cfg = kw.copy()
+        d = json.loads(data.decode('utf-8'))
+        # don't update bucket name
+        if cfg.get('bucket'):
+            d.pop('bucket')
+        # also don't update bucket2 name
+        if cfg.get('bucket2'):
+            d.pop('bucket2', None)
+        cfg.update(d)
+    except HTTPError:
+        print(("Invalid name or token: %s" % sys.exc_info()[1]))
+        cfg = dict(token=token, **kw)
+        if 'bucket' not in cfg:
+            sys.exit(1)
+    except Exception:
+        log(syslog.LOG_WARNING, "Failed to download volume config: %s" % sys.exc_info()[1])
+        cfg = dict(token=token, **kw)
+        if 'bucket' not in cfg:
+            sys.exit(1)
+
+    storage = cfg['storage']
+    bucket = cfg['bucket']
+    if storage == 'cos':
+        cfg['bucket'] = ensure_appid_suffix(bucket)
+    if storage == 's3':
+        if cfg.get('accesskey') is None:
+            cfg['accesskey'] = os.environ.get("AWS_ACCESS_KEY_ID")
+        if cfg.get('secretkey') is None:
+            cfg['secretkey'] = os.environ.get("AWS_SECRET_ACCESS_KEY")
+
+    if storage not in special_engines:
+        if cfg.get('accesskey') is None:
+            msg = "%s for %s://%s" % (access_key_name(storage), storage, bucket)
+            cfg['accesskey'] = require_input(msg).strip()
+        if cfg.get('secretkey') is None:
+            msg = "%s for %s://%s" % (secret_key_name(storage), storage, bucket)
+            cfg['secretkey'] = require_input(msg).strip()
+        if '/' in cfg['accesskey']:
+            cfg['accesskey'] = quote(cfg['accesskey'], safe='')
+
+    storage2 = cfg.get("storage2")
+    if storage2 == 's3':
+        if cfg.get('accesskey2') is None:
+            cfg['accesskey2'] = os.environ.get("AWS_ACCESS_KEY_ID")
+        if cfg.get('secretkey2') is None:
+            cfg['secretkey2'] = os.environ.get("AWS_SECRET_ACCESS_KEY")
+
+    if cfg.get('replicated'):
+        if storage2 not in special_engines:
+            bucket2 = cfg['bucket2']
+            if storage2 == 'cos':
+                cfg['bucket2'] = ensure_appid_suffix(bucket2)
+            if cfg.get('accesskey2') is None:
+                cfg['accesskey2'] = require_input("%s for %s://%s" % (access_key_name(storage2), storage2, cfg['bucket2']))
+            if cfg.get('secretkey2') is None:
+                cfg['secretkey2'] = require_input("%s for %s://%s" % (secret_key_name(storage2), storage2, cfg['bucket2']))
+            if '/' in cfg['accesskey2']:
+                cfg['accesskey2'] = quote(cfg['accesskey2'], safe='')
+    return cfg
+
+
+def ensure_appid_suffix(bucket):
+    parts = bucket.rsplit('-', 1)
+    app_id_in_name = len(parts) == 2 and parts[1].isdigit() and len(parts[1]) >= 8
+    if '.' not in bucket and not app_id_in_name:
+        appid = require_input("AppID for COS")
+        if not appid.isdigit():
+            print("AppID can only have digits")
+            sys.exit(1)
+        bucket = "%s-%s" % (bucket, appid)
+    return bucket
+
+
+def daemonize(name, mountpoint, options):
+    """
+    do the UNIX double-fork magic, see Stevens' "Advanced
+    Programming in the UNIX Environment" for details (ISBN 0201563177)
+    http://www.erlenstar.demon.co.uk/unix/faq_2.html#SEC16
+    """
+    pid = os.fork()
+    if pid > 0:
+        # wait for mount to be ready
+        os.waitpid(pid, 0)
+        p = os.path.join(mountpoint, ".stats")
+        c = 0
+        while c < 10 and not os.path.exists(p):
+            time.sleep(1)
+            c += 1
+        callout = getattr(options, '__flex_volume', None)
+        if not os.path.exists(p):
+            log(syslog.LOG_ERR, "mount %s failed, try with -f to see more details" % mountpoint)
+            if callout:
+                _fail()
+            sys.exit(1)
+        if callout:
+            _success()
+        elif sys.stdout.isatty():
+            sys.stdout.write('\033[92mOK\033[0m, {0} is ready at {1}.\n'.format(name, mountpoint))
+        sys.exit(0)
+
+    # decouple from parent environment
+    os.chdir("/")
+    os.setsid()
+    os.umask(0)
+
+    # do second fork
+    pid = os.fork()
+    if pid > 0:
+        sys.exit(0)
+
+    # redirect standard file descriptors
+    sys.stdout.flush()
+    sys.stderr.flush()
+    si = open("/dev/null", 'r')
+    se = open(options.logpath, 'a+')
+    os.dup2(si.fileno(), sys.stdin.fileno())
+    os.dup2(se.fileno(), sys.stdout.fileno())
+    os.dup2(se.fileno(), sys.stderr.fileno())
+
+def auth():
+    parser = optparse.OptionParser(prog="juicefs auth NAME",
+        description='authorize a filesystem, so you can mount without specifying them again')
+
+    parser.add_option("--password", type=str,
+                      help="the password of the filesystem (deprecated, use token)")
+    parser.add_option("--bucket", type=str,
+                      help="name or endpoint of the bucket (optional)")
+    parser.add_option("--token", type=str,
+                      help="the token of the filesystem")
+    parser.add_option("--accesskey", type=str,
+                      help="the access key id of the bucket (optional)")
+    parser.add_option("--secretkey", type=str,
+                      help="the secret key of the bucket (optional)")
+    parser.add_option("--bucket2", type=str,
+                      help="name or endpoint of the secondary bucket (optional)")
+    parser.add_option("--accesskey2", type=str,
+                      help="the access key id of secondary bucket (optional)")
+    parser.add_option("--secretkey2", type=str,
+                      help="the secret key of secondary bucket (optional)")
+    parser.add_option("--passphrase", type=str,
+                      help="passphrase for encrypted key")
+    parser.add_option("--subdir", dest="subdir", help="auth a sub-directory")
+    parser.add_option("--no-update", dest="update", action="store_false", default=True,
+                      help="use local config only")
+    options, args = parser.parse_args()
+    if not args:
+        print("No filesystem specified")
+        return 1
+    name = args[0]
+
+    if options.password:
+        options.token = options.password
+
+    kwargs = {}
+    for opt_key in ('token', 'bucket', 'accesskey', 'secretkey',
+                   'bucket2', 'accesskey2', 'secretkey2', 'passphrase'):
+        if getattr(options, opt_key) is not None:
+            kwargs[opt_key] = getattr(options, opt_key)
+    cfg = load_cfg(name, options.update, **kwargs)
+
+    if cfg['storage'] in ('ceph', 'tikv'):
+        global MOUNT_URL, MOUNT_PATH
+        MOUNT_URL += '.' + cfg['storage']
+        MOUNT_PATH += '.' + cfg['storage']
+    install()
+    cfg.pop('tested', None)
+    test_credentials(name, cfg, options)
+
+
+def get_default_cache_dir():
+    if os.getuid() != 0:
+        return os.path.expanduser('~/.juicefs/cache')
+    return '/var/jfsCache'
+
+
+def get_default_log_path():
+    if os.getuid() != 0:
+        return os.path.expanduser('~/.juicefs/log/juicefs.log')
+    return '/var/log/juicefs.log'
+
+
+def patch_updatedb():
+    path = "/etc/updatedb.conf"
+    if os.path.exists(path):
+        data = open(path).read()
+        ps = data.split(' fuse.sshfs ')
+        if len(ps) == 2 and not ps[1].startswith('fuse.juicefs'):
+            with open(path, 'w') as f:
+                f.write(' fuse.sshfs fuse.juicefs '.join(ps))
+
+
+def mount():
+    parser = optparse.OptionParser(prog="juicefs mount NAME MOUNTPOINT",
+                                   description='Mount a filesystem')
+
+    storeOptions = optparse.OptionGroup(parser, "Object Storage Options")
+    storeOptions.add_option("--external", action="store_true",
+                            help="Use the external endpoint (outside of the region)")
+    storeOptions.add_option("--internal", action="store_true",
+                            help="use only the internal endpoint (within the same region)")
+    storeOptions.add_option("--max-uploads", dest="maxUploads", type=int, default=20,
+                            help="Max number of concurrent uploads (default: 20)")
+    storeOptions.add_option("--prefetch", dest="prefetch", type=int, default=1,
+                            help="number of concurrent prefetching (default: 1)")
+    storeOptions.add_option("--upload-limit", dest="uploadLimit", type=int, default=0,
+                            help="Maximum bandwidth for upload (Mbps, default: unlimited)")
+    storeOptions.add_option("--download-limit", dest="downloadLimit", type=int, default=0,
+                            help="Maximum bandwidth for download (Mbps, default: unlimited)")
+    storeOptions.add_option("--delete-limit", dest="deleteLimit", type=float, default=None,
+                            help="Maximum qps for deletion (0: disallow, default: unlimited)")
+    storeOptions.add_option("--get-timeout", dest="getTimeout", type=int, default=None,
+                            help="Max number of seconds to get an object (default: 60)")
+    storeOptions.add_option("--put-timeout", dest="putTimeout", type=int, default=None,
+                            help="Max number of seconds to upload an object (default: 60)")
+    storeOptions.add_option("--gc", action="store_true",
+                            help="cleanup unused chunks after mounting immediately")
+    storeOptions.add_option("--dry", action="store_true",
+                            help="do not delete chunks during GC")
+    storeOptions.add_option("--flip", action="store_true",
+                            help="flip the two replicated bucket (prefer secondary bucket)")
+    parser.add_option_group(storeOptions)
+
+    securityOptions = optparse.OptionGroup(parser, "Security Options")
+    securityOptions.add_option("--rsa-key", dest="rsaKey",
+                               help="path to RSA private key (PEM). " +
+                               "Passphrase will be asked or provided with JFS_RSA_PASSPHRASE")
+    parser.add_option_group(securityOptions)
+
+    cacheOptions = optparse.OptionGroup(parser, "Cache Options")
+    cacheOptions.add_option("--cache-dir", dest="cacheDir", type=str, default=get_default_cache_dir(),
+                      help="A directory to cache data (default: %s)" % get_default_cache_dir())
+    cacheOptions.add_option("--cache-size", dest="cacheSize", type=int, default=1024,
+                      help="the size of disk cache in MB (default: 1GB)")
+    cacheOptions.add_option("--free-space-ratio", dest="freeSpace", type=float, default=0.2,
+                      help="min free space ratio on cache disk (default: 0.2)")
+    cacheOptions.add_option("--buffer-size", dest="bufferSize", type=int,
+                      help="the total size of memory used for read/write buffering in MB (default: 300MB)")
+    cacheOptions.add_option("--cache-mode", dest="cacheMode", type="str",
+                      help="file permission for cached blocks (default: 0600)")
+    cacheOptions.add_option("--cache-group", dest="cacheGroup", type=str, default="",
+                      help="the name of group to join and provide remote cache (default: no sharing)")
+    cacheOptions.add_option("--subgroups", dest="subGroups", type=int, default=0,
+                      help="the number of sub-groups in a cache group (default: 0)")
+    cacheOptions.add_option("--group-ip", dest="groupIP", type=str, default="",
+                      help="IP address for group cache")
+    cacheOptions.add_option("--no-sharing", dest="noSharing", action="store_true",
+                      help="do not share cached blocks to others (default: false)")
+    cacheOptions.add_option("--writeback", action="store_true",
+                      help="data will be written to local disk first, and be upload to object store asynchronously in the background")
+    cacheOptions.add_option("--cache-partial-only", dest="cachePartialOnly", action="store_true",
+                      help="only cache the blocks for small reads")
+    cacheOptions.add_option("--metacache", action="store_true", default=True,
+                      help="cache metadata in client")
+    cacheOptions.add_option("--metacacheto", type=int, default=300,
+                      help="meta cache timeout in seconds (default: 300)")
+    cacheOptions.add_option("--max-cached-inodes", dest="maxCachedInodes", type=int, default=5000000,
+                      help="the max number of cached inodes (default: 5000000)")
+    cacheOptions.add_option("--opencache", action="store_true",
+                      help="open a file for read using cached metadata")
+    cacheOptions.add_option("--attrcacheto", type=float, default=1,
+                      help="attribute cache timeout in seconds (default: 1)")
+    cacheOptions.add_option("--entrycacheto", type=float, default=1,
+                      help="file entry cache timeout in seconds (default: 1)")
+    cacheOptions.add_option("--direntrycacheto", type=float, default=1,
+                      help="directory entry cache timeout in seconds (default: 1)")
+    parser.add_option_group(cacheOptions)
+
+    fuseOptions = optparse.OptionGroup(parser, "FUSE Options")
+    fuseOptions.add_option("--allow-other", dest="allow_other", action="store_true",
+                           help="allow other users to access (enabled when mounted as root)")
+    fuseOptions.add_option("--enable-xattr", dest="enable_xattr", action="store_true",
+                           help="Enable xattr support")
+    fuseOptions.add_option("--enable-acl", dest="enable_acl", action="store_true",
+                           help="Enable ACL support")
+    fuseOptions.add_option("--no-posix-lock", dest="no_posix_lock", action="store_true",
+                           help="Disable POSIX lock support")
+    fuseOptions.add_option("--no-bsd-lock", dest="no_bsd_lock", action="store_true",
+                           help="Disable BSD lock support")
+    fuseOptions.add_option("--block-interrupt", dest="blockInterrupt", type=float, default=1,
+                           help="number of seconds to block interruption (default: 1)")
+    fuseOptions.add_option("-o", dest="fuse_opts", type=str,
+                           help="other FUSE options")
+    parser.add_option_group(fuseOptions)
+
+    parser.add_option("-f", "--foreground", dest="foreground", action="store_true",
+                      help="run in foreground")
+    parser.add_option("-b", dest="background", action="store_true",
+                      help="run in background in Docker")
+    parser.add_option("--subdir", dest="subdir", help="mount a sub-directory")
+    parser.add_option("--ioretries", dest="ioretries", default=30,
+                      help="number of retries for network failure (default: 30)")
+    parser.add_option("--http", dest="address", default="",
+                      help="listen address to serve files using HTTP (for example, localhost:8080)")
+    parser.add_option("--disallow-list", dest="disallowList", action="store_true",
+                      help="Disallow list a directory in WebDAV")
+    parser.add_option("--log", dest="logpath", default=get_default_log_path(),
+                      help="path of log file (default: %s)" % get_default_log_path())
+    parser.add_option("-v", dest="debug", action="store_true",
+                      help="enable debug logging")
+    parser.add_option("--no-update", dest="update", action="store_false", default=True,
+                      help="use local config only")
+
+    experimental = optparse.OptionGroup(parser, "Experimental Options")
+    experimental.add_option("--min-balance-diff", dest="minBalanceDiff", type=int)
+    experimental.add_option("--min-dir-inodes", dest="minDirInodes", type=int)
+    experimental.add_option("--max-space", dest="maxSpace", default=0, type=int,
+                            help="limit the total space in GiB (default: no limit)")
+    experimental.add_option("--source-dir", dest="sourceDir",
+                            help="Use JuiceFS as cache for a directory")
+    experimental.add_option("--refresh-interval", dest="refreshInterval", type=int, default=60,
+                            help="checking for update (seconds)")
+
+    parser.add_option_group(experimental)
+
+    deprecated = optparse.OptionGroup(parser, "Deprecated Options")
+    deprecated.add_option("--async", dest="writeback", action="store_true",
+                          help="see --writeback")
+    deprecated.add_option("--ssl", action="store_true",
+                          help="Use HTTPS to access object store (always enabled)")
+    deprecated.add_option("--dircache", dest="metacache", action="store_true",
+                          help="see --metacache")
+    deprecated.add_option("-d", dest="debug", action="store_true",
+                          help="see -v")
+    deprecated.add_option("--cacheDir", type=str, default=get_default_cache_dir(),
+                          help="see --cache-dir")
+    deprecated.add_option("--cacheSize", type=int, default=1024,
+                          help="see --cache-size")
+    deprecated.add_option("--allow-root", dest="allow_root", action="store_true",
+                          help="allow root to access (use allow_other instead)")
+    deprecated.add_option("--no-sync", dest="nosync", action="store_true",
+                          help="donot sync the replicated object store")
+    deprecated.add_option("--batch", type=float, default=0.0,
+                          help="number of seconds to wait to combine multiple small files as single object")
+    deprecated.add_option("--keep-fd", dest="keepFd", action="store_true",
+                          help="keep FUSE session alive (require python 3.3+)")
+    parser.add_option_group(deprecated)
+
+    if sys.argv[0].endswith("mount.juicefs"):
+        # called via mount or fstab
+        args, others = sys.argv[:3], sys.argv[3:]
+        # remove the leading '/' added by systemd
+        if args[1].startswith("/"):
+            args[1] = args[1][1:]
+        if args[1].startswith("JuiceFS:"):
+            args[1] = args[1][len("JuiceFS:"):]
+        fuse_opts = []
+        BAD_OPTS = ('_netdev', 'rw', 'defaults', 'remount')
+        for i in range(len(others)):
+            if others[i] == "-o":
+                opts = others[i + 1].split(',')
+                for opt in opts:
+                    opt = opt.strip()
+                    if not opt or opt in BAD_OPTS: continue
+                    if '=' in opt and parser.has_option("--"+opt.split('=')[0].strip()):
+                        k, v = opt.split('=')
+                        args += ['--' + k.strip(), v.strip()]
+                    elif (parser.has_option("--"+opt) and
+                            parser.get_option("--"+opt).action in
+                            ("store_true", "store_false")):
+                        args += ['--' + opt]
+                    else:
+                        fuse_opts.append(opt)
+        if fuse_opts:
+            args += ['-o', ','.join(fuse_opts)]
+        sys.argv = args
+
+    options, args = parser.parse_args()
+    if len(args) < 2:
+        print("No filesystem and mountpoint specified")
+        return 1
+    name, mountpoint = args
+
+    if not os.path.exists(os.path.dirname(options.logpath)):
+        os.makedirs(os.path.dirname(options.logpath))
+
+    # call-out from Kubernetes/Flexvolume
+    kw = {}
+    if mountpoint.startswith("{") and mountpoint.endswith("}"):
+        jopt = json.loads(mountpoint)
+        mountpoint = name
+        name = jopt.get('name', jopt.get('kubernetes.io/pvOrVolumeName'))
+        if not name:
+            _fail("no name provided")
+        for k in ('token', 'bucket', 'accesskey', 'secretkey', 'bucket2', 'accesskey2', 'secretkey2'):
+            if k in jopt:
+                kw[k] = jopt[k]
+            else:
+                sk = 'kubernetes.io/secret/' + k
+                if sk in jopt:
+                    import base64
+                    kw[k] = base64.standard_b64decode(jopt[sk]).decode('utf8')
+        options.__dict__.update(jopt)
+        options.__flex_volume = True
+
+    mountpoint = os.path.realpath(mountpoint)
+    if not os.path.exists(mountpoint):
+        try:
+            os.makedirs(mountpoint)
+        except OSError:
+            _umount(mountpoint)
+    try:
+        if os.listdir(mountpoint) and os.stat(mountpoint).st_ino != 1:
+            log(syslog.LOG_WARNING, "%s is not empty" % mountpoint)
+    except Exception:
+        _umount(mountpoint)
+
+    if os.getuid() != 0:
+        if OS == 'Darwin':
+            if os.stat(mountpoint).st_uid != os.getuid():
+                log(syslog.LOG_ERR, "current user should own %s" % mountpoint)
+                sys.exit(1)
+        else:
+            try:
+                t = os.path.join(mountpoint, "test")
+                f = open(t, 'w')
+                f.close()
+                os.remove(t)
+            except IOError:
+                log(syslog.LOG_ERR, "Do not have write permission on %s" % mountpoint)
+                sys.exit(1)
+
+    cfg = load_cfg(name, options.update, **kw)
+    if cfg['storage'] in ('ceph', 'tikv'):
+        global MOUNT_URL, MOUNT_PATH
+        MOUNT_URL += '.' + cfg['storage']
+        MOUNT_PATH += '.' + cfg['storage']
+    install()
+    if os.getuid() == 0:
+        patch_updatedb()
+    test_credentials(name, cfg, options)
+    check_mountability()
+    launch_mount(name, mountpoint, cfg, options)
+
+
+def check_mountability():
+    '''Check if the mounting would work on this environment.
+    If there's something wrong, addtional infomation would be printed.
+    '''
+    p = subprocess.Popen([MOUNT_PATH, "-V"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _, stderr_data = p.communicate()
+    if p.returncode != 0:
+        stderr_data = ensure_str(stderr_data)
+        if 'osxfuse' in stderr_data and 'Library not loaded' in stderr_data:
+            print("Oops, it seems that osxfuse is not installed.\nYou can get it here: https://osxfuse.github.io/")
+        else:
+            print(stderr_data)
+        sys.exit(1)
+
+
+def umount():
+    parser = optparse.OptionParser(prog="juicefs umount PATH",
+        description="""Unmount JuiceFS""")
+    parser.add_option("-f", "--force", action="store_true",
+                      help="unmount it forcibly.")
+    options, paths = parser.parse_args()
+    if len(paths) != 1:
+        parser.print_usage()
+        return
+    return _umount(paths[0], options.force)
+
+def find_mountpoint(path):
+    path = os.path.abspath(path)
+    d = path if os.path.isdir(path) else os.path.dirname(path)
+    while d != '/':
+        st = os.stat(d)
+        if st.st_ino == 1:
+            return d
+        d = os.path.dirname(d)
+
+def find_master_addr(path):
+    import socket
+    path = os.path.abspath(path)
+    d = path if os.path.isdir(path) else os.path.dirname(path)
+    while d != '/' and not os.path.exists(os.path.join(d, ".masterinfo")):
+        d = os.path.dirname(d)
+    if d == '/': return
+    f = open(os.path.join(d, ".masterinfo"), 'rb')
+    masterinfo = f.read()
+    f.close()
+    port, = struct.unpack(">H", masterinfo[4:6])
+    addr = ("127.0.0.1", port)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect(addr)
+    sock.setblocking(1)
+    return sock
+
+def list_sessions(conn, vmode=4):
+    CLTOMA_SESSION_LIST = 508
+    args = struct.pack("!B", vmode)
+    _send_to_master(conn, CLTOMA_SESSION_LIST, args)
+    data, length = _recv_from_master(conn)
+    sessions = _parse_sessions(data, length, vmode)
+    return sessions
+
+def _parse_sessions(data, length, vmode):
+    statscnt = struct.unpack(">H",data[:2])[0]
+    pos = 2
+    while pos < length:
+        sessionid,ip1,ip2,ip3,ip4,_,_,_,_,_,_,ileng = struct.unpack(">LBBBBHBBLBLL",data[pos:pos+25])
+        pos += 25
+        info = data[pos:pos+ileng]
+        pos += ileng
+        pleng = struct.unpack(">L",data[pos:pos+4])[0]
+        pos += 4
+        path = data[pos:pos+pleng]
+        pos += pleng
+        if sys.version_info[0]>=3:
+            info = info.decode('ascii', errors='ignore')
+            path = path.decode('ascii', errors='ignore')
+        # Jump over unused data
+        pos += 30
+        pos += statscnt*4
+        pos += statscnt*4
+        if vmode >= 5:
+            statlen = struct.unpack(">I",data[pos:pos+4])[0]
+            pos += 4
+            pos += statlen
+        ses = Session(sessionid, ip1, ip2, ip3, ip4, info)
+        yield ses
+
+def _send_to_master(conn, cmd, data, msg_id=42):
+    args = struct.pack("!I", msg_id) + data
+    msg = struct.pack("!II", cmd, len(args)) + args
+    conn.sendall(msg)
+
+def _read_full(conn, length):
+    data = b''
+    while len(data) < length:
+        d = conn.recv(length-len(data))
+        if not d:
+            raise EOFError("read")
+        data += d
+    return data
+
+def _recv_from_master(conn):
+    header = _read_full(conn, 12)
+    _, length, msg_id = struct.unpack("!III", header)
+    length -= 4 # msg_id is already read
+    return _read_full(conn, length), length
+
+def list_open_files(conn, sessionid):
+    CLTOMA_LIST_OPEN_FILES = 532
+    data = struct.pack("!I", sessionid)
+    _send_to_master(conn, CLTOMA_LIST_OPEN_FILES, data)
+    data, length = _recv_from_master(conn)
+    inodes = _parse_inodes(data, length)
+    return _get_paths_by_inodes(conn, inodes)
+
+def lookup_inode(conn, inode):
+    CLTOMA_FUSE_PATHS = 486
+
+    data = struct.pack("!Q", inode)
+    _send_to_master(conn, CLTOMA_FUSE_PATHS, data)
+    data, length = _recv_from_master(conn)
+    while len(data)>4:
+        l, = struct.unpack("I", data[:4])
+        yield ensure_str(data[4:4+l])
+        data = data[4+l:]
+
+def _get_paths_by_inodes(conn, inodes):
+    for i in inodes:
+        for path in lookup_inode(conn, i):
+            yield path
+
+def _parse_inodes(data, length):
+    start, step = 0, 4
+    return [struct.unpack(">I", data[i:i+4])[0] for i in range(start, length, step)]
+
+def lsof():
+    parser = optparse.OptionParser(prog="juicefs lsof [PATH]",
+        description="""list recently (within 10 minutes) opened files""")
+    options, paths = parser.parse_args()
+    if len(paths) != 1:
+        parser.print_usage()
+        return
+    path = paths[0]
+    conn = find_master_addr(path)
+    if not conn:
+        print(('%s is not inside JuiceFS' % path))
+        return 1
+    mountpoint = find_mountpoint(path)
+    prefix = os.path.abspath(path)[len(mountpoint)+1:]
+    sessions = list_sessions(conn)
+    for s in sessions:
+        for p in list_open_files(conn, s.sessionid):
+            p = ensure_str(p)
+            if p.startswith(prefix):
+                p = p.lstrip('/')
+                p = s.mountpoint + '/' + p
+                print("%s(%s): %s" % (s.host, s.ip, p))
+
+def info():
+    parser = optparse.OptionParser(prog="juicefs info [PATH]",
+        description="""Show information of a directory or file in JuiceFS""")
+    parser.add_option("-n", "--plain", action="store_true",
+                      help="show numbers in plain format")
+    options, paths = parser.parse_args()
+    if not paths:
+        parser.print_usage()
+        return
+
+    if paths[0].isdigit() and not os.path.exists(paths[0]):
+        conn = find_master_addr(os.getcwd())
+    else:
+        conn = find_master_addr(paths[0])
+    if not conn:
+        print(('%s is not inside JuiceFS' % paths[0]))
+        return 1
+    CLTOMA_FUSE_READ_CHUNK = 432
+    CLTOMA_FUSE_GETDIRSTATS = 462
+
+    def snum(n):
+        return locale.format_string("%d", n, grouping=True)
+
+    def ssize(s):
+        if options.plain or s < 1024:
+            return str(s)
+        b = 0
+        while s > 1024:
+            s /= 1024.0
+            b += 1
+        return "%.2f%s" % (s, 'BKMGTPE'[b] if b > 0 else '')
+
+    for path in paths:
+        if path.isdigit() and not os.path.exists(path):
+            p = list(lookup_inode(conn, int(path)))
+            if not p:
+                print("cannot find inode", path)
+                continue
+            path = os.path.join(os.getcwd(), p[0])
+        print((path + ":"))
+        stat = os.stat(path)
+        if os.path.isdir(path):
+            conn.sendall(struct.pack("!IIIQ", CLTOMA_FUSE_GETDIRSTATS, 12, 1, stat.st_ino))
+            rcmd, size = struct.unpack("!II", _read_full(conn, 8))
+            data = _read_full(conn, size)[4:]
+            if size == 60:
+                inodes, dirs, files, _, _, chunks, _, _, length, size, _ = \
+                    struct.unpack("!IIIIIIIIQQQ", data)
+            elif size == 36:
+                inodes, dirs, files, chunks, length, size = struct.unpack("!IIIIQQ", data)
+            elif size == 5:
+                print(("Error: %d" % struct.unpack("B", data)))
+                return
+            else:
+                print(("unexpected length: %d" % size))
+                return
+            print((" inodes: \t%s" % snum(inodes)))
+            print(("  directories: \t%s" % snum(dirs)))
+            print(("  files: \t%s" % snum(files)))
+            print((" chunks: \t%s" % snum(chunks)))
+            print((" length: \t%s" % ssize(length)))
+            print((" size: \t\t%s" % ssize(size)))
+        else:
+            print((' inode: \t%s' % stat.st_ino))
+            print((' length: \t%s' % ssize(stat.st_size)))
+            print((' size: \t\t%s' % ssize((((stat.st_size - 1) >> 12) + 1) << 12)))
+            chunks = ((stat.st_size-1) >> 26) + 1
+            print((" chunks: \t%s" % chunks))
+            for i in range(chunks):
+                conn.sendall(struct.pack("!IIIQIB", CLTOMA_FUSE_READ_CHUNK, 17, 1, stat.st_ino, i, 0))
+                cmd, size = struct.unpack("!II", _read_full(conn, 8))
+                data = _read_full(conn, size)
+                if len(data) == 24:
+                    _, chunkid, clength = struct.unpack("!QQI", data[4:])
+                    print(("% 5d:\t%s\t%s" % (i, chunkid, ssize(clength))))
+                else:
+                    flag = data[12]
+                    if flag == '\0':
+                        clength, = struct.unpack("!Q", data[4:12])
+                        print(("% 5d:\t%s\t%s") % (i, data[24:], ssize(clength)))
+                        break
+                    elif flag == '\2':
+                        clength, = struct.unpack("!Q", data[4:12])
+                        print(("% 5d:\t%s\t%s") % (i, data[17:], ssize(clength)))
+                        break
+                    else:
+                        n = int((len(data) - 13)/20)
+                        for j in range(n):
+                            cid,clen,off,l = struct.unpack("!QIII",data[13+j*20:13+j*20+20])
+                            print("% 5d:\t%d\t%s\t%s\t%s" % (i, cid, clen, off,(l)))
+
+
+def warmup():
+    parser = optparse.OptionParser(prog="juicefs warmup [PATH]",
+        description="""Warm-up cache for the files""")
+    parser.add_option("-f", "--listfile", type=str, help="file containing a list of paths (one path per line)")
+    parser.add_option("-c", "--concurrent", type=int, default=50, help="number of concurrent workers (default: 50)")
+    parser.add_option("-b", dest="background", action="store_true", help="run in background")
+    options, paths = parser.parse_args()
+    if not paths and not options.listfile:
+        parser.print_usage()
+        return
+    if options.listfile:
+        paths.extend([line.strip() for line in open(options.listfile) if line.strip()])
+
+    mp = find_mountpoint(paths[0])
+    assert mp, 'Path %s is not inside JuiceFS!' % paths[0]
+    conn = find_master_addr(mp)
+    assert conn, 'Failed to setup connection!'
+
+    def _send(conn, batch, concurrent, background):
+        paths = '\n'.join(batch)
+        if Py3:
+            paths = paths.encode('utf-8')
+        conn.sendall(struct.pack("!III%dsHB" % len(paths),
+                                 1000, 7+len(paths), len(paths), paths, concurrent, int(not background)))
+        if not background:
+            _read_full(conn, 9)
+            print("%d paths are warmed up." % len(batch))
+        else:
+            print("Warm-up cache for %d paths in backgroud" % len(batch))
+
+    start = len(mp)
+    batch = list()
+    for path in paths:
+        if path.startswith(mp):
+            batch.append(path[start:])
+        else:
+            print('%s is not inside JuiceFS' % path)
+            continue
+        if len(batch) >= 10240:
+            _send(conn, batch, options.concurrent, options.background)
+            batch = list()
+    if batch:
+        _send(conn, batch, options.concurrent, options.background)
+
+
+def heal():
+    parser = optparse.OptionParser(prog="juicefs heal NAME",
+        description="""Heal a replicated filesystem by sychronize the underlying object storages""")
+    parser.add_option("--start", default="",
+                      help="start of keys to sync")
+    parser.add_option("-v", dest="debug", action="store_true",
+                      help="enable debug logging")
+    parser.add_option("--upload-limit", dest="uploadLimit", type=int, default=0,
+                      help="Maximum bandwidth for upload (Mbps, default: unlimited)")
+    parser.add_option("--no-update", dest="update", action="store_false", default=True,
+                      help="Use local config only")
+    options, args = parser.parse_args()
+    if not args:
+        parser.print_usage()
+        return
+    name = args[0]
+    cfg = load_cfg(name, options.update)
+    if not cfg.get('replicated', False):
+        print("Only replicated filesystem need heal")
+        return 1
+    install()
+    prepare_environ(name, cfg, options)
+    args = ["juicefs", "-heal", "-ssl"]
+    if options.debug:
+        args.append("-v")
+    if options.start:
+        args.extend(["-healStart", options.start])
+    if options.uploadLimit:
+        args.extend(("-uploadLimit", str(int(options.uploadLimit/8.0*1024*1024))))
+    os.execv(MOUNT_PATH, args)
+
+def find_name(dst):
+    dst = os.path.abspath(dst)
+    if OS != 'Linux':
+        print("Please specify the NAME of JuiceFS using --name")
+        sys.exit(1)
+    best_name = None
+    common_prefix = ''
+    for line in open('/proc/mounts'):
+        name, mountpoint, _ = line.split(' ', 2)
+        if name.startswith("JuiceFS:") and dst.startswith(mountpoint):
+            if not best_name or len(mountpoint) > len(common_prefix):
+                best_name = name.split(':')[1]
+                common_prefix = mountpoint
+    if not best_name:
+        print("Please specify the NAME of JuiceFS using --name")
+        sys.exit(1)
+    return best_name
+
+def import_():
+    parser = optparse.OptionParser(prog="juicefs import URI DST",
+        description="""Import existing files from object storage, URI should be
+        BUCKET_NAME[.DOMAIN]/PREFIX, DST is a directory (part of mounted JuiceFS) """)
+    # parser.add_option("--start", default="", help="start of keys to import")
+    parser.add_option("--name", default="", help="the name of JuiceFS (optional under Linux)")
+    parser.add_option("--mode", default="0440", type=str,
+                      help="the Unix permission mode of imported files")
+    parser.add_option("-v", dest="debug", action="store_true",
+                      help="enable debug logging")
+    parser.add_option("--no-update", dest="update", action="store_false", default=True,
+                      help="use local config only")
+    options, args = parser.parse_args()
+    if len(args) < 2:
+        parser.print_usage()
+        return
+    uri, dst = args
+    if not os.path.exists(dst):
+        os.makedirs(dst)
+    dst = os.path.abspath(dst)
+    name = options.name or find_name(dst)
+    cfg = load_cfg(name, options.update)
+    install()
+    test_credentials(name, cfg, options)
+    prepare_environ(name, cfg, options)
+    default_endpoint = create_endpoint(name, cfg, options)
+    if uri.startswith("/"):
+        uri = default_endpoint + uri
+
+    args = ["juicefs", "-import", uri, "-dst", dst, "-mode", options.mode, "-ssl"]
+    if options.debug:
+        args.append("-v")
+    os.execv(MOUNT_PATH, args)
+
+
+def rmr():
+    parser = optparse.OptionParser(prog="juicefs rmr dir ...",
+        description="Fastest way to remove a directory recursively.")
+    _, args = parser.parse_args()
+    if not args:
+        parser.print_usage()
+        return
+
+    paths = [os.path.abspath(arg.rstrip(os.path.sep)) for arg in args]
+    conns = {}
+    for p in paths:
+        parent = os.path.dirname(p)
+        if parent not in conns:
+            conns[parent] = find_master_addr(parent)
+    ret_code = 0
+    for p in paths:
+        r = rm_directory(p, conns[os.path.dirname(p)])
+        if r == 1:
+            ret_code = r
+    return ret_code
+
+
+def rm_directory(path, conn):
+    if not os.path.exists(path):
+        print(("%s does not exist." % path))
+        return 1
+
+    if not conn:
+        print(('%s is not inside JuiceFS' % path))
+        return 1
+
+    dirname = os.path.dirname(path)
+    parent = os.stat(dirname).st_ino
+    name = os.path.basename(path)
+    if Py3:
+        name = name.encode('utf-8')
+    CLTOMA_FUSE_UNLINKDIR = 538
+    size = 21 + len(name)
+    arguments = [CLTOMA_FUSE_UNLINKDIR, size, 0x2E, parent, len(name), name, os.getuid(), os.getgid()]
+    req = struct.pack("!IIIQB%dsII" % len(name), *arguments)
+    conn.sendall(req)
+
+    data = _read_full(conn, 21)
+    if len(data) != 21:
+        print("remove %s failed" % path)
+        return 1
+    rcmd, size, msgid, status, success, left = struct.unpack("!IIIBII", data)
+    if status != 0:
+        print(STATUS_ERROR.get(status, "failed: %d" % status))
+        return 1
+    print("%s: %d deleted, %d left." % (path, success, left))
+
+def snapshot():
+    parser = optparse.OptionParser(prog="juicefs snapshot src dst [options]\n    or juicefs snapshot -d path",
+        description="""Create or remove snapshot.""")
+    parser.add_option("-d", "--delete", action="store_true",
+                      help="remove a snapshot")
+    parser.add_option("-f", "--force", action="store_true",
+                      help="overwrite existing objects, or remove as much as possible")
+    parser.add_option("-c", "--copy", action="store_true",
+                      help="create objects with current uid,gid,umask (like 'cp')")
+    # parser.add_option("-p", "--preserve", action="store_true",
+    #                   help="preserve hardlinks")
+    options, paths = parser.parse_args()
+    if not paths or options.delete and len(paths) != 1 or not options.delete and len(paths) != 2:
+        parser.print_usage()
+        return
+
+    if options.delete:
+        src, dst = "", paths[0]
+        inode_src = 0
+        while dst.endswith(os.path.sep):
+            dst = dst[:-1]
+        if not os.path.exists(dst):
+            print(("%s does not exist." % dst))
+            return 1
+    else:
+        src, dst = paths
+        while src.endswith(os.path.sep):
+            src = src[:-1]
+        if not os.path.exists(src):
+            print(("%s does not exist." % src))
+            return 1
+        inode_src = os.stat(src).st_ino
+        if dst.endswith(os.path.sep):
+            dst = os.path.join(dst, os.path.basename(src))
+        if not options.force and os.path.exists(dst):
+            print(("%s already exists" % dst))
+            return 1
+
+    parent = os.path.dirname(os.path.abspath(dst))
+    name_dst = os.path.basename(dst)
+    if Py3:
+        name_dst = name_dst.encode('utf-8')
+    if not os.path.exists(parent):
+        print(("%s does not exists." % parent))
+        return 1
+    inode_dst = os.stat(parent).st_ino
+
+    conn = find_master_addr(dst)
+    if not conn:
+        print(('%s is not inside JuiceFS' % dst))
+        return 1
+
+    smode = 0
+    if options.delete:
+        smode |= 0x80
+    if options.force:
+        smode |= 5
+    if options.copy:
+        smode |= 2
+        umask = os.umask(0)
+        os.umask(umask)
+    else:
+        umask = 0
+    # if options.preserve:
+    #     smode |= 8
+
+    CLTOMA_FUSE_SNAPSHOT = 468
+    MATOCL_FUSE_SNAPSHOT = 469
+    req = struct.pack("!IIIQQB%dsIIBH"%len(name_dst), CLTOMA_FUSE_SNAPSHOT, 32+len(name_dst),
+        1, inode_src, inode_dst, len(name_dst), name_dst, os.getuid(), os.getgid(), smode, umask)
+    conn.sendall(req)
+    data = _read_full(conn, 13)
+    rcmd, size, msgid, status = struct.unpack("!IIIB", data)
+    if status != 0:
+        print(STATUS_ERROR.get(status, "failed: %d" % status))
+
+def merge():
+    parser = optparse.OptionParser(prog="juicefs merge SRC ...",
+        description="""merge files together without copying.""")
+    parser.add_option("-o", "--output", type=str,
+                      help="path for merged file")
+    parser.add_option("-w", "--overwrite", action="store_true",
+                      help="overwrite existing file")
+    parser.add_option("-a", "--append", action="store_true",
+                      help="append to end of existing file")
+    options, srcs = parser.parse_args()
+    if not srcs:
+        parser.print_usage()
+        sys.exit(0)
+    dst = options.output
+    if not dst:
+        print("no output")
+        sys.exit(1)
+    if os.path.exists(dst):
+        if not options.overwrite and not options.append:
+            print("%s already exists" % dst)
+            sys.exit(1)
+        if options.overwrite:
+            os.remove(dst)
+    if not os.path.exists(dst):
+        f = open(dst, 'wb')
+        f.close()
+
+    conn = find_master_addr(dst)
+    if not conn:
+        print(('%s is not inside JuiceFS' % dst))
+        return 1
+
+    CLTOMA_FUSE_APPENDFILE = 448
+    dstino = os.stat(dst).st_ino
+    for p in srcs:
+        p = os.path.realpath(p)
+        if not os.path.isfile(p):
+            print("%s is not a file" % p)
+            return 1
+        srcino = os.stat(p).st_ino
+        conn.sendall(struct.pack("!IIIQQ", CLTOMA_FUSE_APPENDFILE, 20, 1, dstino, srcino))
+        cmd, size = struct.unpack("!II", _read_full(conn, 8))
+        data = _read_full(conn, size)
+        if cmd != CLTOMA_FUSE_APPENDFILE+1 or size != 5:
+            print("invalid response: cmd=%d size=%d" % (cmd, size))
+            return 1
+        status, = struct.unpack("!B", data[4:])
+        if status != 0:
+            print("merge %s failed: code=%d" % (p,status))
+            return 1
+
+def walk(path):
+    if not os.path.isdir(path):
+        return [path]
+    rs = []
+    for root, dirs, names in os.walk(path):
+        for n in sorted(names):
+            rs.append(os.path.join(root, n))
+        dirs.sort()
+    return rs
+
+def search(qs, rs, mutex, options):
+    while True:
+        try:
+            i, path = qs.get()
+        except Exception:
+            return
+        args = ['zgrep' if path.endswith('.gz') else 'grep']
+        if sys.stdout.isatty():
+            args.append('--color=always')
+        if options.header:
+            args.append('-H')
+        if options.line_number:
+            args.append('-n')
+        if options.ignore_case:
+            args.append('-i')
+        if options.extended_regexp:
+            args.append('-E')
+        if options.invert_match:
+            args.append('-v')
+        for e in options.patterns:
+            args.extend(["-e", e])
+        args.append(path)
+        try:
+            # workaround a bug: https://bugs.python.org/issue27406
+            mutex.acquire()
+            p = subprocess.Popen(args, bufsize=1<<20, stdout=subprocess.PIPE, stderr=open("/dev/null", 'w'), env={'LC_ALL':'C'})
+            rs[i] = p.stdout
+            mutex.release()
+            p.wait()
+        except Exception:
+            log(syslog.LOG_WARNING, "failed to search %s: %s" % (path, sys.exc_info()[1]))
+            rs[i] = ''
+
+def grep():
+    parser = optparse.OptionParser(prog="juicefs grep [PATTERN] PATH ...",
+        description="""parallelized file pattern searcher (experimental).""")
+    import multiprocessing
+    parser.add_option("-j", "--jobs", type=int, default=multiprocessing.cpu_count(),
+                      help="number of parallel jobs (default: %d)" % multiprocessing.cpu_count())
+    parser.add_option("-e", "--regexp", dest="patterns", action="append")
+    parser.add_option("-E", "--extended-regexp", action="store_true")
+    parser.add_option("-H", dest="header", action="store_true",
+                      help="Always print filename headers with output lines.")
+    parser.add_option("-n", "--line-number", action="store_true")
+    parser.add_option("-i", "--ignore-case", action="store_true")
+    parser.add_option("-v", "--invert-match", action="store_true",
+                      help="Selected lines are those not matching any of the specified patterns.")
+    options, files = parser.parse_args()
+    if not options.patterns:
+        if len(files) < 2:
+            parser.print_usage()
+            return
+        pattern, files = files[0], files[1:]
+        options.patterns = [pattern]
+    ps = sum((walk(f) for f in files), [])
+    rs = [None] * len(ps)
+    try:
+        import queue
+    except ImportError:
+        import Queue as queue
+    qs = queue.Queue()
+    for i, p in enumerate(ps):
+        qs.put((i, p))
+    import threading
+    mutex = threading.Lock()
+    ts = [start_thread(search, (qs, rs, mutex, options)) for i in range(options.jobs)]
+    try:
+        for i in range(len(rs)):
+            while rs[i] is None:
+                time.sleep(0.1)
+            r = rs[i]
+            if r == '': continue
+            for line in r:
+                try:
+                    os.write(sys.stdout.fileno(), line)
+                except EnvironmentError:
+                    sys.stderr.close()
+                    return
+            r.close()
+    except KeyboardInterrupt:
+        pass
+
+def init():
+    sys.stdout.write(json.dumps(dict(status='Success', capabilities=dict(attach=False))))
+
+def _ismounted(mntpath):
+    if not os.path.exists(mntpath):
+        return False
+    return os.path.exists(os.path.join(mntpath, ".masterinfo"))
+
+def _success():
+    sys.stdout.write(json.dumps(dict(status='Success')))
+    sys.exit(0)
+
+def _fail(message='Failed'):
+    sys.stderr.write(json.dumps(dict(status='Failure', message=message)))
+    sys.exit(1)
+
+def unmount():
+    mntpath = sys.argv[1]
+    if not _ismounted(mntpath):
+        _success()
+    os.system("umount %s &> /dev/null" % mntpath)
+    if _ismounted(mntpath):
+        os.system("umount -l %s &> /dev/null" % mntpath)
+        # TODO: find the process and kill it
+    if _ismounted(mntpath):
+        _fail("Failed to umount JuiceFS at %s" % mntpath)
+    else:
+        _success()
+
+def _watch_oplog(path, filename, delay=0.1):
+    oplog_path = os.path.join(path, filename)
+    with open(oplog_path, 'rt') as f:
+        if os.path.getsize(oplog_path) > 10485760: # greater than 10 MiB
+            f.seek(-10240 * 1024, os.SEEK_END) # seek to last 10 MiB
+            f.readline() # prevent broken line
+        while True:
+            new = f.readline()
+            if new and len(new) > 2:
+                yield new.strip()
+            else:
+                time.sleep(delay)
+
+def _find_getch():
+    try: import termios
+    except ImportError:
+        import msvcrt
+        return msvcrt.getch
+    import sys, tty
+    def _getch():
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return ch
+    return _getch
+
+def _find_clear(flush_interval):
+    if not sys.stdout.isatty(): return lambda: None
+    from functools import partial
+    if os.name == 'nt':
+        return partial(os.system, 'cls')
+    elif flush_interval < 0.1:
+        return partial(sys.stdout.write, '\033[3J\033[1;1H')
+    else:
+        return partial(sys.stdout.write, '\033[2J\033[1;1H')
+
+def _tty_clean():
+    if os.name == 'nt':
+        os.system('cls')
+    elif sys.stdout.isatty():
+        sys.stdout.write('\033[3J\033[1;1H')
+        sys.stdout.write('\033[2J\033[1;1H')
+
+def _bind_key_press(oplog_queue, clear_func):
+    getch = _find_getch()
+    while True:
+        input_ch = getch()
+        if input_ch == '1': oplog_queue.sort_by = 0
+        elif input_ch == '2': oplog_queue.sort_by = 1
+        elif input_ch == '3': oplog_queue.sort_by = 2
+        elif input_ch == '4': oplog_queue.sort_by = 3
+        elif input_ch == '5': oplog_queue.sort_by = 4
+        elif input_ch == 'c': oplog_queue.group_by = 'cmd'
+        elif input_ch == 'p': oplog_queue.group_by = 'pid'
+        elif input_ch == 'u': oplog_queue.group_by = 'uid'
+        elif input_ch == 'x': oplog_queue.filter_by_uid = oplog_queue.filter_by_pid = ''
+        elif input_ch == 'q': sys.exit(0)
+        _flush_profiling(oplog_queue, clear_func)
+
+def _flush_profiling(oplog_queue, clear_func):
+    w, stats = oplog_queue.statistics
+    clear_func()
+    header = (oplog_queue.group_by.upper(), 'Number', u'Average(us)', u'Total(us)', 'Percentage(%)')
+    print('\033[92m> JuiceFS Profiling [WINDOW SIZE: %.2fs/%.2fs]\033[0m' %
+        (w, oplog_queue.window_size))
+    print('\033[97m[1]Sort by %s\t[2]Sort by NUM\t[3]Sort by AVG\t[4] Sort by TOT\t[5] Sort by %%\033[0m' % oplog_queue.group_by.upper())
+    print('\033[97m[c]Group by CMD\t[p]Group by PID\t[u]GROUP by UID\t[q] Exit\033[0m')
+    if oplog_queue.filter_by_uid:
+        print('\033[96m[Filter by UID: %s] [x]Cancel Filter\033[0m' % oplog_queue.filter_by_uid)
+    if oplog_queue.filter_by_pid:
+        print('\033[96m[Filter by PID: %s] [x]Cancel Filter\033[0m' % oplog_queue.filter_by_pid)
+    print('\033[94m%-16s% 10s% 15s% 18s% 18s\033[0m' % header)
+    for stat in stats:
+        print('\033[93m%-16s% 10d% 15.0f% 18d% 18.1f\033[0m' % stat)
+
+def _auto_flush(oplog_queue, interval, clear_func):
+    _tty_clean()
+    print('\033[92m> JuiceFS Profiling [loading...]\033[0m')
+    while not oplog_queue.statistics[1]:
+        time.sleep(0.1)
+    while True:
+        _flush_profiling(oplog_queue, clear_func)
+        time.sleep(interval)
+
+def _profiling(path, filename, oplog_queue):
+    for line in _watch_oplog(path, filename):
+        try: oplog_queue.add(Oplog(line))
+        except Exception: pass
+
+class Oplog:
+    def __init__(self, oplog_line):
+        parts = oplog_line.split()
+        date, ts, uid, _, pid, _, self.cmd = parts[:7]
+        end_ts = int(time.mktime(time.strptime(
+            '%s %s' % (date, ts[:8]),
+            "%Y.%m.%d %H:%M:%S"))
+        ) * 1000000 + int(ts[9:15])
+        self.dur = int(float(parts[-1][1:-1])*1000000)
+        self.start_ts = (end_ts - self.dur) / 1000000.0
+        self.uid, self.pid = uid.split(':')[-1], pid.split(':')[-1]
+
+class OplogQueue:
+    def __init__(self, group_by, sort_by, filter_by_uid, filter_by_pid, window_size):
+        self._data = deque()
+        self._time = lambda: time.mktime(datetime.datetime.now().timetuple())
+        self.group_by = group_by
+        self.sort_by = sort_by
+        self.filter_by_uid = filter_by_uid
+        self.filter_by_pid = filter_by_pid
+        self.window_size = window_size
+
+    def add(self, oplog):
+        if oplog.start_ts >= self._time() - self.window_size:
+            self._data.append(oplog)
+
+    def clean(self):
+        edge = self._time() - self.window_size
+        while self._data and self._data[0].start_ts < edge:
+            self._data.popleft()
+
+    @property
+    def current_window_size(self):
+        self.clean()
+        return self._time() - self._data[0].start_ts if self._data else 0.0
+
+    @property
+    def summary(self):
+        summary = defaultdict(list)
+        for oplog in list(self._data):
+            if (self.filter_by_uid and oplog.uid not in self.filter_by_uid.split(',')) or (
+                    self.filter_by_pid and oplog.pid not in self.filter_by_pid.split(',')):
+                continue
+            summary[getattr(oplog, self.group_by)].append(oplog.dur)
+        return summary
+
+    @property
+    def statistics(self):
+        w = self.current_window_size
+        result = [(k, len(v), sum(v) / float(len(v)), sum(v), sum(v) / w / 10000)
+                  for k, v in self.summary.items()]
+        result.sort(key=lambda i: i[self.sort_by], reverse=True if self.sort_by != 0 else False)
+        return w, result
+
+def profile():
+    parser = optparse.OptionParser(prog="juicefs profile",
+        description="""Collect and profiling the log (Experimental).""")
+    parser.add_option("-x", "--path", default='/jfs',
+                      help="the path of log, default path is /jfs")
+    parser.add_option("-f", "--file", default='.ophistory',
+                      help="the filename of log, default filename is .ophistory")
+    parser.add_option("-g", "--group-by", default='cmd',
+                      choices=['uid', 'pid', 'cmd'],
+                      help="group the output by a specific attribute, default by cmd [choose from uid, pid, cmd]")
+    parser.add_option("-s", "--sort-by", default='total_time',
+                      choices=['group', 'number', 'avg_time', 'total_time'],
+                      help="sort the output by a specific column, default by total_time [choose from group, number, avg_time, total_time]")
+    parser.add_option("-u", "--filter-by-uid", default='', type=str,
+                      help="filter the output by one or multiple keywords on the UID column, please separate multi keywords by comma (,)")
+    parser.add_option("-p", "--filter-by-pid", default='', type=str,
+                      help="filter the output by one or multiple keywords on the PID column, please separate multi keywords by comma (,)")
+    parser.add_option("-w", "--window-size", default=60, type=float,
+                      help="the window size of collect oplog, 60 seconds by default")
+    parser.add_option("-i", "--flush-interval", default=2, type=float,
+                      help="the interval of flush output, 2 seconds by default")
+    options, _ = parser.parse_args()
+    sort_by = ['group', 'number', 'avg_time', 'total_time'].index(options.sort_by)
+    oplog_queue = OplogQueue(options.group_by, sort_by, options.filter_by_uid,
+                             options.filter_by_pid, options.window_size)
+    clear_func = _find_clear(options.flush_interval)
+    import atexit
+    @atexit.register
+    def clean_history():
+        _tty_clean()
+    start_thread(_profiling, (options.path, options.file, oplog_queue))
+    start_thread(_auto_flush, (oplog_queue, options.flush_interval, clear_func))
+    try:
+        _bind_key_press(oplog_queue, clear_func)
+    except KeyboardInterrupt:
+        pass
+
+def version():
+    parser = optparse.OptionParser(prog="juicefs version",
+        description="""Show the version of JuiceFS client and check for update.""")
+    parser.add_option("-u", "--upgrade", action="store_true")
+    if OS == 'Linux':
+        parser.add_option("-r", "--restart", action="store_true")
+    options, _ = parser.parse_args()
+    if options.upgrade:
+        try:
+            if update(SELFPATH, JFS_URL):
+                os.execv(SELFPATH, [SELFPATH]+sys.argv)
+                return
+            else:
+                update(MOUNT_PATH, MOUNT_URL, check_integrity=check_mount_integrity)
+        except Exception:
+            log(syslog.LOG_WARNING, "failed to upgrade: %s" % sys.exc_info()[1])
+            return 1
+    else:
+        install()
+    out, _ = subprocess.Popen([MOUNT_PATH, "-V"], stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+    sys.stdout.write(ensure_str(out))
+    curver = ensure_str(out).strip().split(' ', 2)[2]
+    if OS == 'Linux' and options.restart:
+        for line in open('/proc/%d/mountstats' % os.getpid()).readlines():
+            if 'fuse.juicefs' in line:
+                ps = line.split(' ')
+                if len(ps) == 8:
+                    restart(ps[4], curver)
+
+
+def read_config(mp):
+    try:
+        path = os.path.join(mp, ".jfsconfig")
+        if not os.path.exists(path):
+            return {}
+        return json.load(open(path))
+    except Exception as e:
+        log(syslog.LOG_WARNING, "read config: %s" % sys.exc_info()[1])
+        return {}
+
+def restart(mp, curver):
+    try:
+        config = read_config(mp)
+        ver = config.get('Version', 'unknown')
+        if 'Pid' in config and ver >= "4.5.5":
+            if ver != curver:
+                pid = config['Pid']
+                sys.stdout.write('%s: upgrade from %s to %s ...' % (mp, ver, curver))
+                os.kill(pid, signal.SIGHUP)
+                for i in range(10):
+                    if read_config(mp).get('Pid') != pid:
+                        print('\033[92m OK\033[0m')
+                        break
+                    sys.stdout.write('.')
+                    time.sleep(1)
+                else:
+                    print('timeout')
+            else:
+                print("%s: not changed" % mp)
+        else:
+            print("%s: not supported (version: %s), please remount it manually." % (mp, ver))
+    except Exception as e:
+        log(syslog.LOG_WARNING, "restart: %s" % sys.exc_info()[1])
+
+
+class Benchmark:
+
+    def __init__(self, file, file_size_mb, block_size, count):
+        self.file = file
+        self.file_size_mb = file_size_mb
+        self.block_size = block_size
+        self.count = count
+        self.filenames = []
+
+        self.done = 1
+
+    def write_one_file(self, filename, buff, block_count):
+        time_took = []
+        f = os.open(filename, os.O_CREAT | os.O_WRONLY, 0o777)
+        for i in range(block_count):
+            start = time.time()
+            os.write(f, buff)
+            if i == block_count-1:
+                os.close(f)
+            t = time.time() - start
+            time_took.append(t)
+            self.done += 1
+            if sys.stdin.isatty():
+                sys.stdout.write('\rwriting files: %.2f %%' % (self.done * 100 / (self.count * block_count)))
+                sys.stdout.flush()
+        return time_took
+
+    def read_one_file(self, filename, block_size, block_count):
+        time_took = []
+        f = os.open(filename, os.O_RDONLY, 0o777)
+        while True:
+            start = time.time()
+            buff = os.read(f, block_size)
+            t = time.time() - start
+            if not buff:
+                break
+            time_took.append(t)
+            self.done += 1
+            if sys.stdin.isatty():
+                sys.stdout.write('\rreading files: %.2f %%' % (self.done * 100 / (self.count * block_count)))
+                sys.stdout.flush()
+
+        os.close(f)
+        return time_took
+
+    def stat_one_file(self, filename):
+        start = time.time()
+        os.stat(filename)
+
+        self.done += 1
+        if sys.stdin.isatty():
+            sys.stdout.write('\rStating files: %.2f %%' % (self.done * 100 / (self.count)))
+            sys.stdout.flush()
+
+        return time.time() - start
+
+    def write_file_test(self):
+        block_count = int(math.ceil(self.file_size_mb / self.block_size))
+        block_size = int(min(self.block_size, self.file_size_mb) * (1 << 20))
+        time_took = []
+        self.done = 0
+        buff = os.urandom(block_size)
+
+        for i in range(self.count):
+            filename = '%s.%s' % (self.file, i)
+            time_took.extend(self.write_one_file(filename, buff, block_count))
+            self.filenames.append(filename)
+
+        total_mb = self.file_size_mb * self.count
+        return time_took, total_mb
+
+    def read_file_test(self):
+        block_count = int(math.ceil(self.file_size_mb / self.block_size))
+        block_size = int(self.block_size * (1 << 20))
+        time_took = []
+        self.done = 0
+
+        for filename in self.filenames:
+            time_took.extend(self.read_one_file(filename, block_size, block_count))
+
+        total_mb = self.file_size_mb * len(self.filenames)
+        return time_took, total_mb
+
+    def stat_file_test(self):
+        self.done = 0
+        return [self.stat_one_file(f) for f in self.filenames]
+
+
+def benchmark():
+    import random
+    import string
+
+    parser = optparse.OptionParser(prog="juicefs benchmark",
+        usage='usage: %prog [options] path-to-test',
+        description="run benchmark, including read/write/stat big/small files.")
+    parser.add_option("--dest", dest='dest', default='/jfs/benchmark',
+                      help="path to run benchmark (default: /jfs/benchmark)")
+    parser.add_option("--block-size", dest='block_size', type=float, default=1,
+                      help="block size in MiB (default: 1MiB)")
+    parser.add_option("--bigfile-file-size", dest='bigfile_file_size', type=float, default=1024,
+                      help="size of big file in MiB (default: 1024MiB)")
+    parser.add_option("--smallfile-file-size", dest='smallfile_file_size', type=float, default=0.1,
+                      help="size of small file in MiB (default: 0.1MiB)")
+    parser.add_option("--smallfile-count", dest='smallfile_count', type=int, default=100,
+                      help="number of small files (default: 100)")
+
+    options, args = parser.parse_args()
+    if len(args) > 1:
+        print('should provide only one destination path to run benchmark')
+        return
+
+    if OS == 'Darwin':
+        purge_command = ['purge']
+    elif OS == 'Linux':
+        purge_command = ['sh', '-c', 'echo 3 > /proc/sys/vm/drop_caches']
+    else:
+        print('currently only support Linux/macOS')
+        return
+
+    dest = options.dest
+    if args:
+        dest = args[0]
+    dest = os.path.join(dest, '__juicefs_benchmark_%s__' % ''.join(random.sample(string.ascii_letters, 8)))
+    if not os.path.exists(dest):
+        try:
+            os.makedirs(dest)
+        except OSError as e:
+            print('error making test dirs in %s, exit' % options.dest, e)
+            return
+
+    if os.getuid():
+        purge_command.insert(0, 'sudo')
+
+    try:
+        bigfiletest = Benchmark(os.path.join(dest, 'bigfile'), options.bigfile_file_size, options.block_size, 1)
+
+        time_took, total_mb = bigfiletest.write_file_test()
+        print('\rWritten a big file (%s MB): %.2f MB/s\n' % (bigfiletest.file_size_mb, total_mb / sum(time_took)))
+        if os.getuid():
+            print('Cleaning kernel cache, may ask for root privilege...')
+        subprocess.check_call(purge_command)
+        if os.getuid():
+            print('Kernel cache cleaned')
+
+        time_took, total_mb = bigfiletest.read_file_test()
+        print('\rRead a big file (%s MB): %.2f MB/s\n' % (bigfiletest.file_size_mb, total_mb / sum(time_took)))
+
+        smallfiletest = Benchmark(os.path.join(dest, 'smallfile'), options.smallfile_file_size, options.block_size, options.smallfile_count)
+
+        time_took, total_mb = smallfiletest.write_file_test()
+        print('\rWritten %s small files (%s KB): %.1f files/s, %.1f ms for each file\n' % (
+            smallfiletest.count, smallfiletest.file_size_mb*1000, smallfiletest.count / sum(time_took), sum(time_took)*1000 / smallfiletest.count))
+        subprocess.check_call(purge_command)
+
+        time_took, total_mb = smallfiletest.read_file_test()
+        print('\rRead %s small files (%s KB): %.1f files/s, %.1f ms for each file\n' % (
+            smallfiletest.count, smallfiletest.file_size_mb*1000, smallfiletest.count / sum(time_took), sum(time_took)*1000 / smallfiletest.count))
+        subprocess.check_call(purge_command)
+
+        time_took = smallfiletest.stat_file_test()
+        print('\rStated %s files: %.1f files/s, %.1f ms for each file\n' % (
+            smallfiletest.count, smallfiletest.count / sum(time_took), sum(time_took)*1000 / smallfiletest.count))
+    finally:
+        import shutil
+        shutil.rmtree(dest)
+
+
+def usage():
+    print("""juicefs COMMAND [options]
+
+COMMAND could be:
+  auth      authorize a filesystem
+  mount     mount a filesystem
+  umount    umount a filesystem
+  info      show information of file or directory
+  lsof      list recent opened files
+  import    import files from existing object storage
+  rmr       remove all files/directories recursively
+  snapshot  create or remove snapshots
+  grep      parallelized file pattern searcher
+  profile   analyze log (Experimental)
+  benchmark run benchmark
+  warmup    build cache for target directories/files
+  version   show the version""")
+
+
+COMMANDS = [
+    'auth', 'mount', 'umount', 'version', 'init', 'unmount',
+    'info', 'heal', 'import', 'snapshot', 'rmr', 'merge', 'grep', 'warmup',
+    'lsof', 'profile', 'benchmark',
+]
+
+def main():
+    if len(sys.argv) < 2:
+        return usage()
+
+    if sys.argv[0].endswith("mount.juicefs"):
+        command = "mount"
+    else:
+        sys.argv.pop(0)
+        command = sys.argv[0]
+    if command not in COMMANDS:
+        log(syslog.LOG_CRIT, "invalid command: %s" % command)
+        usage()
+        return 1
+    if command == 'import':
+        command = 'import_'
+    return globals()[command]()
+
+if __name__ == '__main__':
+    sys.exit(main() or 0)

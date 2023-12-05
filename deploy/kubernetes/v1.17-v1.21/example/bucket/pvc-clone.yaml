@@ -1,0 +1,15 @@
+---                             
+apiVersion: v1                  
+kind: PersistentVolumeClaim     
+metadata:                       
+  name: mosfs-pvc-clone
+spec:                           
+  storageClassName: mosfs-sc
+  dataSource:                   
+    name: mosfs-pvc
+    kind: PersistentVolumeClaim 
+  accessModes:                  
+    - ReadWriteMany             
+  resources:                    
+    requests:                   
+      storage: 1Gi              

@@ -1,0 +1,189 @@
+# Default values for mosfs-csi.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# -- Overrides the chart's computed name
+# nameOverride: ""
+# -- Overrides the chart's computed fullname
+# fullnameOverride: ""
+
+image:
+  repository: sandstone/mosfs-csi-driver
+  tag: "v1.1.6"
+  pullPolicy: ""
+
+warmup:
+  enabled: true
+  image:
+    repository: sandstone/cache-controller
+    tag: "v1.1.6"
+
+namespace: test
+mosfsShareMount: true
+cephConf: "<config me>"
+
+sidecars:
+  livenessProbeImage:
+    repository: quay.io/k8scsi/livenessprobe
+    tag: "v1.1.0"
+  nodeDriverRegistrarImage:
+    repository: k8s.gcr.io/sig-storage/csi-node-driver-registrar
+    tag: "v2.4.0"
+  csiProvisionerImage:
+    repository: registry.k8s.io/sig-storage/csi-provisioner
+    tag: "v3.0.0"
+  csiSnapshotterImage:
+    repository: registry.k8s.io/sig-storage/csi-snapshotter
+    tag: "v4.1.1"
+  csiSnapshotterControllerImage:
+    repository: registry.k8s.io/sig-storage/snapshot-controller
+    tag: "v4.1.1"
+  csiResizerImage:
+    repository: k8s.gcr.io/sig-storage/csi-resizer
+    tag: "v1.4.0"
+
+# for some environment without dns server and want to use /etc/hosts instead
+# - ip: "127.0.0.1"
+#   hostnames:
+#   - "s3.mosfs.local"
+#   - "redis.mosfs.local"
+hostAliases: []
+
+# -- kubelet working directory,can be set using `--root-dir` when starting kubelet
+kubeletDir: /var/lib/kubelet
+
+# -- mosfs mount dir
+mosfsMountDir: /var/lib/mosfs/volume
+mosfsConfigDir: /var/lib/mosfs/config
+
+dnsPolicy: ClusterFirstWithHostNet
+dnsConfig:
+  {}
+  # Example config which uses the AWS nameservers
+  # dnsPolicy: "None"
+  # dnsConfig:
+  #   nameservers:
+#     - 169.254.169.253
+
+serviceAccount:
+  controller:
+    # Specifies whether a service account of controller should be created
+    create: true
+    # Annotations to add to the service account
+    annotations: {}
+    # The name of the service account to use.
+    # If not set and create is true, a name is generated using the fullname template
+    name: "mosfs-csi-controller-sa"
+  node:
+    # Specifies whether a service account of node service should be created
+    create: true
+    # The name of the service account to use.
+    # If not set and create is true, a name is generated using the fullname template
+    name: "mosfs-csi-node-sa"
+  snapshotController:
+    create: true
+
+controller:
+  # Default is true. This Component will control CSI Driver deployed on node
+  enabled: true
+  # Pod Numbers
+  replicas: 1
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+    requests:
+      cpu: 100m
+      memory: 512Mi
+  # -- Grace period to allow the controller to shutdown before it is killed
+  terminationGracePeriodSeconds: 30
+  # -- Affinity for controller pods.
+  # @default -- Hard node and soft zone anti-affinity
+  affinity: {}
+  # -- Node selector for controller pods
+  nodeSelector: {}
+  # controller service
+  service:
+    port: 9909
+    trpe: ClusterIP
+
+node:
+  # Default is true. Node will be deployed every node to server CSI Plugin
+  enabled: true
+  hostNetwork: false
+  resources:
+    limits:
+      cpu: 2000m
+      memory: 5Gi
+    requests:
+      cpu: 1000m
+      memory: 1Gi
+  # -- Grace period to allow the node pod to shutdown before it is killed
+  terminationGracePeriodSeconds: 30
+  # -- Affinity for node pods.
+  # @default -- Hard node and soft zone anti-affinity
+  affinity: {}
+  # -- Node selector for node pods
+  nodeSelector: {}
+  ifPollingKubelet: true
+  # -- Tolerations for node pods
+  tolerations:
+    - key: CriticalAddonsOnly
+      operator: Exists
+
+snapshotController:
+  enabled: true
+  replicas: 1
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+    requests:
+      cpu: 100m
+      memory: 512Mi
+  # -- Grace period to allow the node pod to shutdown before it is killed
+  terminationGracePeriodSeconds: 30
+  # -- Affinity for node pods.
+  # @default -- Hard node and soft zone anti-affinity
+  affinity: {}
+  # -- Node selector for node pods
+  nodeSelector: {}
+
+
+storageClasses:
+  # StorageClass Name. It is important.
+  - name: mosfs-sc
+    # -- Default is true will create a new StorageClass. It will create Secret and StorageClass used by CSI driver
+    enabled: true
+    # -- Either Delete or Retain.
+    reclaimPolicy: Delete
+    # snapshotClass deletionPolicy
+    deletionPolicy: Delete
+
+    backend:
+      # -- The mosfs file system name.
+      fileSystemName: "mosfs"
+      token: "your-token"
+      consoleToken: "your-consoleToken"
+      # -- Access key for object storage
+      accessKey: "mos"
+      # -- Secret key for object storage
+      secretKey: "mos"
+      envs: '{"BASE_URL": "http://20.20.51.211:20101/static","CFG_URL": "http://20.20.51.211:20101/volume/%s/mount"}'
+      storage: "ceph"
+      configs: '{"ceph-conf": "/etc/ceph"}'
+
+
+    mountOptions:
+    # -- Mount Options.
+
+    mountPod:
+      deleteDelay: 2m
+      # mount pod resource requests & limits
+      resources:
+        limits:
+          cpu: 5000m
+          memory: 5Gi
+        requests:
+          cpu: 1000m
+          memory: 1Gi

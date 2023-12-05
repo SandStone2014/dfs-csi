@@ -1,0 +1,64 @@
+# 插件部署的namespace
+namespace: sandstone
+# mosfs-csi 插件镜像配置
+image:
+  repository: sandstone/mosfs-csi-driver
+  tag: "v1.1.6"
+# 配置是否共享mount pod
+mosfsShareMount: false
+warmup:
+  # 配置是否创建warmup controller
+  enabled: false
+  image:
+    repository: sandstone/cache-controller
+    tag: "v1.1.6"
+# storageClass配置：其中如果只配置一个storageClass则将yaml数组中其他项的enabled设置为false即可。
+storageClasses:
+  - name: mosfs-sc-bucket
+    enabled: true
+    # storageClass reclaimPolicy Delete or Retain.
+    reclaimPolicy: Delete
+    # snapshotClass deletionPolicy
+    deletionPolicy: Delete
+    backend:
+      fileSystemName: bucket
+      #fileSystemToken
+      token: "b4d79ce4d072f0ed85c6c30b2fc736b660eb0437"
+      consoleToken: "73cb29ea209d65f1bb27a5d5923595f870bb80f8"
+      # bucket ak/sk
+      accessKey: "fqs"
+      secretKey: "fqs"
+      # console ip和端口需要配置
+      envs: '{"BASE_URL": "http://20.20.51.120:9400/static","CFG_URL": "http://20.20.51.120:9400/volume/%s/mount"}'
+    # mountOptions可配置Qos以及Cache(cache-size,cache-dir), 其中upload-limit与download-limit单位为Mbps，如无需配置则删除mountOptions下的配置即可
+    mountOptions:
+      - upload-limit=10240
+      - download-limit=10240
+      - cache-size=2048
+      - cache-dir=/var/my/cache
+    mountPod:
+      # 当没有业务Pod使用Pvc后，配置延迟多久删除mountPod(2m-->2分钟)
+      # deleteDelay: 2m
+      # mount pod resource requests & limits
+      resources:
+        limits:
+          cpu: 5000m
+          memory: 5Gi
+        requests:
+          cpu: 1000m
+          memory: 1Gi
+  - name: mosfs-sc-rados
+    enabled: false
+    # storageReclaimPolicy
+    reclaimPolicy: Delete
+    # snapshotClass deletionPolicy
+    deletionPolicy: Delete
+    backend:
+      fileSystemName: rados
+      consoleToken: "73cb29ea209d65f1bb27a5d5923595f870bb80f8"
+      token: "bf8a1fc5138ca77fcb11bd71fff5d7864243f91b"
+      storage: ceph
+      accessKey: ceph
+      secretKey: client.admin
+      configs: '{"ceph-conf": "/etc/ceph"}'
+      envs: '{"BASE_URL": "http://20.20.51.120:9400/static","CFG_URL": "http://20.20.51.120:9400/volume/%s/mount"}'

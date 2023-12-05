@@ -1,0 +1,32 @@
+{{- if .Values.warmup.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cache-controller
+  namespace: {{ .Values.namespace }}
+  labels:
+  {{- include "mosfs-csi.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: cache-controller
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: cache-controller
+    spec:
+      containers:
+        - name: cache-controller
+          image: {{ .Values.warmup.image.repository }}:{{ .Values.warmup.image.tag }}
+          env:
+          {{- if .Values.mosfsShareMount }}
+          - name: STORAGE_CLASS_SHARE_MOUNT
+            value: "true"
+          {{- end }}
+          - name: MOSFS_MOUNT_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+      serviceAccountName: cache-controller
+{{- end }}

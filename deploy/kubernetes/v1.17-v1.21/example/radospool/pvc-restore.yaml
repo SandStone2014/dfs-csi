@@ -1,0 +1,16 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mosfs-pvc-restore-rados
+spec:
+  storageClassName: mosfs-sc-rados
+  dataSource:
+    name: csi-mosfs-pvc-snapshot-rados
+    kind: VolumeSnapshot
+    apiGroup: snapshot.storage.k8s.io
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 1Gi

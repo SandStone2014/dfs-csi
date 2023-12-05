@@ -1,0 +1,43 @@
+{{- if .Values.snapshotController.enabled }}
+kind: StatefulSet
+apiVersion: apps/v1
+metadata:
+  labels:
+    app.kubernetes.io/component: snapshot-controller
+    {{- include "mosfs-csi.labels" . | nindent 4 }}
+  name: mosfs-csi-snapshot-controller
+  namespace: {{ .Values.namespace }}
+spec:
+  serviceName: snapshot-controller
+  replicas: {{ .Values.snapshotController.replicas }}
+  selector:
+    matchLabels:
+      app: mosfs-csi-snapshot-controller
+      {{- include "mosfs-csi.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        app: mosfs-csi-snapshot-controller
+        {{- include "mosfs-csi.selectorLabels" . | nindent 8 }}
+    spec:
+    {{- if .Values.hostAliases }}
+      hostAliases:
+      {{- toYaml .Values.hostAliases | nindent 6 }}
+    {{- end }}
+      containers:
+        - name: snapshot-controller
+          image: {{ printf "%s:%s" .Values.sidecars.csiSnapshotterControllerImage.repository .Values.sidecars.csiSnapshotterControllerImage.tag }}
+          args:
+            - "--v=5"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+      serviceAccount: {{ include "mosfs-csi.snapshotController.serviceAccountName" . }}
+      priorityClassName: system-cluster-critical
+      {{- with .Values.controller.affinity }}
+      affinity:
+        {{- tpl . $ | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

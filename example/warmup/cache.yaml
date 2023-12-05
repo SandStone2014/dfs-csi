@@ -1,0 +1,8 @@
+apiVersion: cache.sandstone.com/v1alpha1
+kind: Cache
+metadata:
+  name: warmup-test
+  namespace: default
+spec:
+  pvcName: mosfs-pvc
+  path: ""

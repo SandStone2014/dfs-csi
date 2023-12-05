@@ -1,0 +1,12 @@
+---
+apiVersion: snapshot.storage.k8s.io/v1alpha1
+kind: VolumeSnapshot
+metadata:
+  name: csi-mosfs-pvc-snapshot-rados
+spec:
+  snapshotClassName: csi-mosfsplugin-snapshotclass-rados
+  source:
+    name: mosfs-pvc-rados
+    kind: PersistentVolumeClaim
+
+

@@ -1,0 +1,41 @@
+Examples on how to configure a storage class and start using the driver are here:
+https://github.com/juicedata/mosfs-csi-driver/tree/master/examples
+# You can refer demos in 'mosfs-csi-driver/examples'
+For quickly test, you can use this file to test:
+
+```
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mosfs-pvc
+  namespace: {{ .Release.Namespace }}
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Pi
+  storageClassName: {{ (index .Values.storageClasses 0).name }}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mosfs-app
+  namespace: {{ .Release.Namespace }}
+spec:
+  containers:
+  - args:
+    - -c
+    - while true; do echo $(date -u) >> /data/out.txt; sleep 5; done
+    command:
+    - /bin/sh
+    image: busybox
+    name: app
+    volumeMounts:
+    - mountPath: /data
+      name: mosfs-pv
+  volumes:
+  - name: mosfs-pv
+    persistentVolumeClaim:
+      claimName: mosfs-pvc
+```
